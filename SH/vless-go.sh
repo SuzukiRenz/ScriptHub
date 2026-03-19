@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ╔══════════════════════════════════════════════════════════════════╗
-# ║          VLESS Personal Edition  v2.0                            ║
+# ║          VLESS Personal Edition  v2.1                            ║
 # ║  支持系统: Debian / Ubuntu / Alpine                               ║
 # ║  代理核心: Xray-core  或  sing-box（安装时选择）                  ║
 # ║  TLS前端:  Caddy（自动申请/续签 Let's Encrypt 证书 + 伪装网站）   ║
@@ -13,9 +13,15 @@
 # ╚══════════════════════════════════════════════════════════════════╝
 # wget -O vless-go.sh https://raw.githubusercontent.com/SuzukiRenz/ScriptHub/refs/heads/main/SH/vless-go.sh && chmod +x vless-go.sh && ./vless-go.sh
 
-# ── 颜色 ─────────────────────────────────────────────────────────────
-RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
-CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
+# ── 颜色定义 ─────────────────────────────────────────────────────────
+# 必须使用 $'\033[...]' 语法，让 bash 在赋值时就完成转义
+# 否则 printf "%s" 输出的是字面量 \033[0;36m 而不是控制序列
+RED=$'\033[0;31m'
+GREEN=$'\033[0;32m'
+YELLOW=$'\033[1;33m'
+CYAN=$'\033[0;36m'
+BOLD=$'\033[1m'
+NC=$'\033[0m'
 
 info()  { echo -e "${GREEN}[✓]${NC} $*"; }
 warn()  { echo -e "${YELLOW}[!]${NC} $*"; }
@@ -53,6 +59,7 @@ check_root() {
 
 detect_os() {
     [[ -f /etc/os-release ]] || error "无法识别操作系统"
+    # shellcheck source=/dev/null
     source /etc/os-release
     OS_ID="${ID}"
     case "$OS_ID" in
@@ -75,7 +82,6 @@ pkg_install() {
     fi
 }
 
-# CPU 架构 → Xray Release 包名后缀
 xray_arch() {
     case "$(uname -m)" in
         x86_64)        echo "64"        ;;
@@ -86,30 +92,29 @@ xray_arch() {
     esac
 }
 
-# CPU 架构 → sing-box Release 包名后缀
 sbox_arch() {
     case "$(uname -m)" in
-        x86_64)        echo "amd64"  ;;
-        aarch64|arm64) echo "arm64"  ;;
-        armv7*)        echo "armv7"  ;;
-        armv6*)        echo "armv6"  ;;
+        x86_64)        echo "amd64" ;;
+        aarch64|arm64) echo "arm64" ;;
+        armv7*)        echo "armv7" ;;
+        armv6*)        echo "armv6" ;;
         *) error "sing-box 不支持该 CPU 架构: $(uname -m)" ;;
     esac
 }
 
 gen_uuid() {
-    if   command -v uuidgen &>/dev/null;               then uuidgen | tr '[:upper:]' '[:lower:]'
-    elif [[ -r /proc/sys/kernel/random/uuid ]];         then cat /proc/sys/kernel/random/uuid
-    elif command -v python3 &>/dev/null;               then python3 -c "import uuid; print(uuid.uuid4())"
+    if   command -v uuidgen &>/dev/null;             then uuidgen | tr '[:upper:]' '[:lower:]'
+    elif [[ -r /proc/sys/kernel/random/uuid ]];       then cat /proc/sys/kernel/random/uuid
+    elif command -v python3 &>/dev/null;             then python3 -c "import uuid; print(uuid.uuid4())"
     else
         local N B C='89ab'
         for (( N=0; N<16; N++ )); do
             B=$(( RANDOM%256 ))
             case $N in
-                6)      printf '4%x'  $(( B%16 )) ;;
-                8)      printf '%c%x' "${C:$((RANDOM%${#C})):1}" $(( B%16 )) ;;
+                6)       printf '4%x'  $(( B%16 )) ;;
+                8)       printf '%c%x' "${C:$((RANDOM%${#C})):1}" $(( B%16 )) ;;
                 3|5|7|9) printf '%02x-' $B ;;
-                *)      printf '%02x'  $B ;;
+                *)       printf '%02x'  $B ;;
             esac
         done; echo
     fi
@@ -132,6 +137,7 @@ is_installed() { [[ -f "$CONF_FILE" ]] && grep -q "^uuid=" "$CONF_FILE"; }
 
 load_conf() {
     [[ -f "$CONF_FILE" ]] || return 1
+    # shellcheck source=/dev/null
     source "$CONF_FILE"
 }
 
@@ -158,14 +164,13 @@ get_server_ip() {
     hostname -I 2>/dev/null | awk '{print $1}'
 }
 
-# 根据已安装的核心类型返回服务名
 proxy_svc_name() {
     load_conf 2>/dev/null
     [[ "${core_type:-xray}" == "singbox" ]] && echo "sing-box" || echo "xray"
 }
 
 # ═══════════════════════════════════════════════════════════════════
-#  安装基础依赖
+#  基础依赖
 # ═══════════════════════════════════════════════════════════════════
 
 install_base_deps() {
@@ -180,7 +185,7 @@ install_base_deps() {
 }
 
 # ═══════════════════════════════════════════════════════════════════
-#  安装 Caddy（官方包源）
+#  Caddy（官方包源）
 # ═══════════════════════════════════════════════════════════════════
 
 install_caddy() {
@@ -190,7 +195,6 @@ install_caddy() {
         echo "caddy_preinstalled=true" >> "$CONF_FILE"
         return
     fi
-
     if [[ "$PKG_MGR" == "apt" ]]; then
         pkg_install debian-keyring debian-archive-keyring apt-transport-https
         curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' \
@@ -202,21 +206,18 @@ install_caddy() {
         apk add --quiet --repository https://dl-cdn.alpinelinux.org/alpine/edge/community caddy \
             || apk add --quiet caddy
     fi
-
     echo "caddy_preinstalled=false" >> "$CONF_FILE"
     info "Caddy 安装完成: $(caddy version 2>/dev/null | head -1)"
 }
 
 # ═══════════════════════════════════════════════════════════════════
-#  安装 Xray-core
-#  官方仓库: https://github.com/XTLS/Xray-core/releases
-#  包格式:   Xray-linux-{arch}.zip
+#  Xray-core  https://github.com/XTLS/Xray-core/releases
+#  包格式: Xray-linux-{arch}.zip
 # ═══════════════════════════════════════════════════════════════════
 
 install_xray() {
     step "安装 Xray-core"
     local ARCH TMP_DIR VER URL
-
     ARCH=$(xray_arch)
     TMP_DIR=$(mktemp -d)
 
@@ -226,17 +227,13 @@ install_xray() {
           | grep '"tag_name"' | head -1 | cut -d'"' -f4)
     [[ -z "$VER" ]] && VER="v25.3.6"
 
-    # 官方 Release 直链
     URL="https://github.com/XTLS/Xray-core/releases/download/${VER}/Xray-linux-${ARCH}.zip"
-    info "下载 Xray ${VER}  arch=${ARCH}"
+    info "版本: ${VER}  arch: ${ARCH}"
     info "源: ${URL}"
 
-    wget -qO "${TMP_DIR}/xray.zip" "$URL" \
-        || error "Xray 下载失败，请检查网络"
-
+    wget -qO "${TMP_DIR}/xray.zip" "$URL" || error "Xray 下载失败，请检查网络"
     unzip -qo "${TMP_DIR}/xray.zip" -d "${TMP_DIR}/out"
     install -m 755 "${TMP_DIR}/out/xray" "$XRAY_BIN"
-
     mkdir -p /usr/local/share/xray
     for f in geoip.dat geosite.dat; do
         [[ -f "${TMP_DIR}/out/${f}" ]] && \
@@ -247,20 +244,17 @@ install_xray() {
 }
 
 # ═══════════════════════════════════════════════════════════════════
-#  安装 sing-box
-#  官方仓库: https://github.com/SagerNet/sing-box/releases
-#  包格式:   sing-box-{ver}-linux-{arch}.tar.gz
+#  sing-box  https://github.com/SagerNet/sing-box/releases
+#  包格式: sing-box-{ver}-linux-{arch}.tar.gz
 # ═══════════════════════════════════════════════════════════════════
 
 install_singbox() {
     step "安装 sing-box"
     local ARCH TMP_DIR VER VER_NUM PKG_NAME URL
-
     ARCH=$(sbox_arch)
     TMP_DIR=$(mktemp -d)
 
-    info "查询最新稳定版本..."
-    # 过滤 alpha / beta / rc，只取正式 release
+    info "查询最新稳定版本（过滤 alpha/beta/rc）..."
     VER=$(curl -s --max-time 10 \
           "https://api.github.com/repos/SagerNet/sing-box/releases" \
           | grep '"tag_name"' \
@@ -269,17 +263,13 @@ install_singbox() {
           | cut -d'"' -f4)
     [[ -z "$VER" ]] && VER="v1.11.4"
 
-    VER_NUM="${VER#v}"    # 去掉 v 前缀：1.11.4
-
-    # 官方 Release 直链
+    VER_NUM="${VER#v}"
     PKG_NAME="sing-box-${VER_NUM}-linux-${ARCH}"
     URL="https://github.com/SagerNet/sing-box/releases/download/${VER}/${PKG_NAME}.tar.gz"
-    info "下载 sing-box ${VER}  arch=${ARCH}"
+    info "版本: ${VER}  arch: ${ARCH}"
     info "源: ${URL}"
 
-    wget -qO "${TMP_DIR}/sing-box.tar.gz" "$URL" \
-        || error "sing-box 下载失败，请检查网络"
-
+    wget -qO "${TMP_DIR}/sing-box.tar.gz" "$URL" || error "sing-box 下载失败，请检查网络"
     tar -xzf "${TMP_DIR}/sing-box.tar.gz" -C "${TMP_DIR}/"
     install -m 755 "${TMP_DIR}/${PKG_NAME}/sing-box" "$SBOX_BIN"
     rm -rf "$TMP_DIR"
@@ -287,7 +277,7 @@ install_singbox() {
 }
 
 # ═══════════════════════════════════════════════════════════════════
-#  伪装网站（对非 WS 请求返回仿 nginx 静态页面）
+#  伪装网站
 # ═══════════════════════════════════════════════════════════════════
 
 setup_fake_web() {
@@ -346,7 +336,7 @@ configure_xray() {
       "protocol": "vless",
       "settings": {
         "clients": [
-          { "id": "${uuid}", "flow": "", "level": 0 }
+          { "id": "${uuid}", "level": 0 }
         ],
         "decryption": "none"
       },
@@ -354,8 +344,7 @@ configure_xray() {
         "network": "ws",
         "security": "none",
         "wsSettings": {
-          "path": "${ws_path}",
-          "headers": { "Host": "" }
+          "path": "${ws_path}"
         }
       },
       "sniffing": {
@@ -380,7 +369,7 @@ configure_xray() {
   }
 }
 EOF
-    info "Xray 配置写入: ${XRAY_CONF}"
+    info "Xray 配置: ${XRAY_CONF}"
 }
 
 # ═══════════════════════════════════════════════════════════════════
@@ -405,13 +394,11 @@ configure_singbox() {
       "listen": "127.0.0.1",
       "listen_port": ${local_port},
       "users": [
-        { "uuid": "${uuid}", "flow": "" }
+        { "uuid": "${uuid}" }
       ],
       "transport": {
         "type": "ws",
-        "path": "${ws_path}",
-        "max_early_data": 0,
-        "early_data_header_name": ""
+        "path": "${ws_path}"
       }
     }
   ],
@@ -427,12 +414,20 @@ configure_singbox() {
   }
 }
 EOF
-    info "sing-box 配置写入: ${SBOX_CONF}"
+    info "sing-box 配置: ${SBOX_CONF}"
 }
 
 # ═══════════════════════════════════════════════════════════════════
 #  Caddy 配置
-#  流量链路: 客户端 :8443 (TLS) → Caddy → 127.0.0.1:local_port (明文 WS)
+#
+#  WebSocket 匹配策略（v2.1 修复）：
+#  只用路径匹配，不额外检测 Connection/Upgrade header。
+#  原因：不同客户端（Shadowrocket/v2rayN/clash 等）发送的
+#        Upgrade header 大小写不一致，额外检测反而导致误判，
+#        让请求 fallthrough 到伪装页面。
+#  reverse_proxy 会自动检测后端 101 响应并处理 WS 升级。
+#  同时加 transport http { versions 1.1 } 强制 HTTP/1.1，
+#  因为 WebSocket 不支持 HTTP/2。
 # ═══════════════════════════════════════════════════════════════════
 
 configure_caddy() {
@@ -440,17 +435,16 @@ configure_caddy() {
     step "生成 Caddy 配置"
     mkdir -p "$CADDY_CONF_DIR"
 
-    # 备份已有主配置（仅首次）
     if [[ -f "$CADDY_MAIN_CONF" ]] && ! grep -q "vless-personal" "$CADDY_MAIN_CONF" 2>/dev/null; then
         cp "$CADDY_MAIN_CONF" "${CADDY_MAIN_CONF}.bak.$(date +%s)"
         info "原 Caddyfile 已备份"
     fi
 
-    # 主配置：全局块 + import 站点文件
     cat > "$CADDY_MAIN_CONF" << EOF
 # ── VLESS Personal Edition ─────────────────────────────────────────
-# 由 vless-personal.sh 自动生成；如需自定义请编辑 ${CADDY_VLESS_CONF}
-# 修改后执行: caddy reload --config ${CADDY_MAIN_CONF}
+# 由 vless-personal.sh 自动生成
+# 修改请编辑 ${CADDY_VLESS_CONF}，然后执行:
+#   caddy reload --config ${CADDY_MAIN_CONF}
 # ──────────────────────────────────────────────────────────────────
 
 {
@@ -464,11 +458,10 @@ configure_caddy() {
 import ${CADDY_VLESS_CONF}
 EOF
 
-    # 站点块（独立文件，卸载时精准删除，不影响主配置）
     cat > "$CADDY_VLESS_CONF" << EOF
 # ── VLESS+WS+TLS 站点配置 ──────────────────────────────────────────
 # 域名: ${domain}   外部端口: ${EXT_PORT}   内部端口: ${local_port}
-# 生成: $(date '+%Y-%m-%d %H:%M:%S')
+# 生成: $(date '+%Y-%m-%d_%H:%M:%S')
 # ──────────────────────────────────────────────────────────────────
 
 ${domain}:${EXT_PORT} {
@@ -479,23 +472,23 @@ ${domain}:${EXT_PORT} {
         ciphers TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384 TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384 TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256 TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256 TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256 TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256
     }
 
-    # WS 升级请求 + 路径匹配 → 转发给代理核心（明文）
-    @proxy_ws {
-        path ${ws_path}
-        header Connection *Upgrade*
-        header Upgrade websocket
-    }
-
-    handle @proxy_ws {
+    # 路径匹配即转发给代理核心
+    # 只用 path 匹配，不检测 Upgrade/Connection header，避免客户端大小写差异导致漏匹配
+    handle ${ws_path} {
         reverse_proxy 127.0.0.1:${local_port} {
             header_up Host            {host}
             header_up X-Real-IP       {remote_host}
             header_up X-Forwarded-For {remote_host}
+            # 立即刷新，保持 WebSocket 长连接流畅
             flush_interval -1
+            # 强制使用 HTTP/1.1，WebSocket 升级不兼容 HTTP/2
+            transport http {
+                versions 1.1
+            }
         }
     }
 
-    # 所有其他请求 → 伪装静态页面
+    # 其余所有请求 → 伪装静态页面
     handle {
         root * ${FAKE_WEBROOT}
         file_server
@@ -503,6 +496,7 @@ ${domain}:${EXT_PORT} {
         header -X-Powered-By
     }
 
+    # 关闭访问日志（减少磁盘 IO）
     log {
         output discard
     }
@@ -581,6 +575,7 @@ EOF
 }
 
 _write_openrc_singbox() {
+    # sing-box 默认输出到 stderr，openrc 的 error_log 捕获 stderr
     cat > /etc/init.d/sing-box << 'EOF'
 #!/sbin/openrc-run
 description="sing-box Proxy Service (VLESS Personal)"
@@ -596,7 +591,7 @@ EOF
 }
 
 # ═══════════════════════════════════════════════════════════════════
-#  配置并启动服务
+#  启动服务
 # ═══════════════════════════════════════════════════════════════════
 
 setup_services() {
@@ -655,7 +650,7 @@ setup_firewall() {
 }
 
 # ═══════════════════════════════════════════════════════════════════
-#  BBR（Debian/Ubuntu；Alpine 跳过）
+#  BBR
 # ═══════════════════════════════════════════════════════════════════
 
 enable_bbr() {
@@ -674,7 +669,7 @@ EOF
 }
 
 # ═══════════════════════════════════════════════════════════════════
-#  快捷命令 vless-p
+#  快捷命令
 # ═══════════════════════════════════════════════════════════════════
 
 setup_shortcut() {
@@ -688,7 +683,7 @@ setup_shortcut() {
 }
 
 # ═══════════════════════════════════════════════════════════════════
-#  显示配置信息 & VLESS 链接
+#  显示配置信息
 # ═══════════════════════════════════════════════════════════════════
 
 show_config() {
@@ -699,37 +694,48 @@ show_config() {
     server_ip=$(get_server_ip)
     [[ "${core_type:-xray}" == "singbox" ]] && core_label="sing-box" || core_label="Xray-core"
 
+    # URL 编码 WS 路径（/ → %2F）
     local encoded_path
-    encoded_path=$(python3 -c "import urllib.parse; print(urllib.parse.quote('${ws_path}'))" 2>/dev/null \
-                   || echo "${ws_path}")
+    if command -v python3 &>/dev/null; then
+        encoded_path=$(python3 -c "import urllib.parse; print(urllib.parse.quote('${ws_path}'))")
+    else
+        # 简单替换 / 为 %2F
+        encoded_path="${ws_path//\//%2F}"
+    fi
 
-    local LINK="vless://${uuid}@${domain}:${EXT_PORT}?encryption=none&security=tls&sni=${domain}&type=ws&host=${domain}&path=${encoded_path}#VLESS-WS-TLS-${domain}"
+    local LINK="vless://${uuid}@${domain}:${EXT_PORT}?encryption=none&security=tls&sni=${domain}&type=ws&host=${domain}&path=${encoded_path}#VLESS-${domain}"
 
-    echo ""; hr
-    echo -e "${CYAN}${BOLD}       VLESS Personal Edition — 节点信息${NC}"; hr
-    printf "  %-16s %s\n" "域名:"      "${CYAN}${domain}${NC}"
-    printf "  %-16s %s\n" "服务器IP:"  "${server_ip}"
-    printf "  %-16s %s\n" "外部端口:"  "${CYAN}${EXT_PORT}${NC}（Caddy TLS）"
-    printf "  %-16s %s\n" "协议:"      "${CYAN}VLESS + WebSocket + TLS${NC}"
-    printf "  %-16s %s\n" "UUID:"      "${CYAN}${uuid}${NC}"
-    printf "  %-16s %s\n" "WS 路径:"   "${CYAN}${ws_path}${NC}"
-    printf "  %-16s %s\n" "内部端口:"  "127.0.0.1:${local_port}（${core_label}）"
-    printf "  %-16s %s\n" "代理核心:"  "${CYAN}${core_label}${NC}"
-    printf "  %-16s %s\n" "TLS:"       "Let's Encrypt（Caddy 自动续签）"
-    printf "  %-16s %s\n" "安装时间:"  "${install_date}"
-    hr; echo ""
+    echo ""
+    hr
+    echo -e "${CYAN}${BOLD}       VLESS Personal Edition — 节点信息${NC}"
+    hr
+    printf "  %-16s ${CYAN}%s${NC}\n" "域名:"      "${domain}"
+    printf "  %-16s %s\n"             "服务器IP:"  "${server_ip}"
+    printf "  %-16s ${CYAN}%s${NC}\n" "外部端口:"  "${EXT_PORT}（Caddy TLS）"
+    printf "  %-16s ${CYAN}%s${NC}\n" "协议:"      "VLESS + WebSocket + TLS"
+    printf "  %-16s ${CYAN}%s${NC}\n" "UUID:"      "${uuid}"
+    printf "  %-16s ${CYAN}%s${NC}\n" "WS 路径:"   "${ws_path}"
+    printf "  %-16s %s\n"             "内部端口:"  "127.0.0.1:${local_port}（${core_label}）"
+    printf "  %-16s ${CYAN}%s${NC}\n" "代理核心:"  "${core_label}"
+    printf "  %-16s %s\n"             "TLS:"       "Let's Encrypt（Caddy 自动续签）"
+    printf "  %-16s %s\n"             "安装时间:"  "${install_date}"
+    hr
+    echo ""
     echo -e "${YELLOW}${BOLD}  ✦ VLESS 链接（复制到客户端）:${NC}"
-    echo -e "  ${GREEN}${LINK}${NC}"; echo ""
+    echo -e "  ${GREEN}${LINK}${NC}"
+    echo ""
     echo -e "${YELLOW}${BOLD}  ✦ 手动填写参数:${NC}"
     printf "  %-10s %s\n" "地址:"   "${domain}"
     printf "  %-10s %s\n" "端口:"   "${EXT_PORT}"
     printf "  %-10s %s\n" "UUID:"   "${uuid}"
     printf "  %-10s %s\n" "传输:"   "WebSocket"
     printf "  %-10s %s\n" "路径:"   "${ws_path}"
-    printf "  %-10s %s\n" "TLS:"    "启用 | SNI: ${domain}"; echo ""
+    printf "  %-10s %s\n" "TLS:"    "启用 | SNI: ${domain}"
+    echo ""
     if command -v qrencode &>/dev/null; then
         echo -e "${BOLD}  ✦ 二维码:${NC}"
-        qrencode -t ansiutf8 "$LINK" 2>/dev/null; echo ""
+        qrencode -t ansiutf8 "$LINK" 2>/dev/null
+        echo ""
     fi
     hr
 }
@@ -742,8 +748,8 @@ show_status() {
     load_conf 2>/dev/null
     local CORE_SVC
     CORE_SVC=$(proxy_svc_name)
-    echo ""; hr; echo -e "${BOLD}  服务状态${NC}"; hr
-
+    echo ""; hr
+    echo -e "${BOLD}  服务状态${NC}"; hr
     for svc in caddy "$CORE_SVC"; do
         if service_is_active "$svc"; then
             printf "  %-12s ${GREEN}● 运行中${NC}\n" "${svc}:"
@@ -751,7 +757,6 @@ show_status() {
             printf "  %-12s ${RED}● 已停止${NC}\n" "${svc}:"
         fi
     done
-
     echo ""; echo -e "${BOLD}  端口监听${NC}"
     if ss -tlnp 2>/dev/null | grep -q ":${EXT_PORT}"; then
         echo -e "  :${EXT_PORT}   ${GREEN}✓ 已监听${NC} (外部 TLS)"
@@ -784,29 +789,68 @@ restart_services() {
 }
 
 # ═══════════════════════════════════════════════════════════════════
-#  查看日志
+#  查看日志（v2.1 改进）
+#
+#  sing-box 日志在 systemd 下通过 journalctl 读取。
+#  服务名含连字符需加引号，同时增加 -xe 参数显示错误上下文。
+#  OpenRC 下直接读取日志文件，并在文件不存在时给出明确提示。
 # ═══════════════════════════════════════════════════════════════════
 
 show_logs() {
+    load_conf 2>/dev/null
     local CORE_SVC
     CORE_SVC=$(proxy_svc_name)
+
     echo ""
-    echo "  1) ${CORE_SVC} 日志"
-    echo "  2) Caddy 日志"
+    echo "  1) ${CORE_SVC} 日志（最近 80 行）"
+    echo "  2) ${CORE_SVC} 错误日志（journalctl -xe，systemd 专用）"
+    echo "  3) Caddy 日志（最近 80 行）"
     echo "  0) 返回"
-    read -rp "  选择 [0-2]: " lc; echo ""
+    read -rp "  选择 [0-3]: " lc
+    echo ""
+
     case "$lc" in
         1)
             if [[ "$INIT_SYS" == "systemd" ]]; then
-                journalctl -u "$CORE_SVC" -n 80 --no-pager 2>/dev/null || echo "无日志"
+                echo -e "${BOLD}  journalctl -u \"${CORE_SVC}\" -n 80 --no-pager${NC}"
+                journalctl -u "${CORE_SVC}" -n 80 --no-pager 2>/dev/null \
+                    || echo "  无日志，请确认服务已启动"
             else
-                tail -80 "/var/log/${CORE_SVC}.log" 2>/dev/null || echo "暂无日志"
-            fi ;;
+                local LOG_FILE="/var/log/${CORE_SVC}.log"
+                if [[ -f "$LOG_FILE" ]]; then
+                    echo -e "${BOLD}  tail -80 ${LOG_FILE}${NC}"
+                    tail -80 "$LOG_FILE"
+                else
+                    warn "日志文件 ${LOG_FILE} 不存在"
+                    echo "  请检查服务是否正在运行: rc-service ${CORE_SVC} status"
+                fi
+            fi
+            ;;
         2)
             if [[ "$INIT_SYS" == "systemd" ]]; then
-                journalctl -u caddy -n 80 --no-pager 2>/dev/null || echo "无日志"
+                echo -e "${BOLD}  journalctl -xe -u \"${CORE_SVC}\" --no-pager${NC}"
+                journalctl -xe -u "${CORE_SVC}" --no-pager 2>/dev/null \
+                    || echo "  无日志"
             else
-                echo "（访问日志已设为 discard）"; fi ;;
+                warn "journalctl -xe 仅在 systemd 下可用"
+            fi
+            ;;
+        3)
+            if [[ "$INIT_SYS" == "systemd" ]]; then
+                echo -e "${BOLD}  journalctl -u caddy -n 80 --no-pager${NC}"
+                journalctl -u caddy -n 80 --no-pager 2>/dev/null \
+                    || echo "  无日志"
+            else
+                local LOG_FILE="/var/log/caddy/caddy.log"
+                [[ -f "$LOG_FILE" ]] || LOG_FILE="/var/log/caddy.log"
+                if [[ -f "$LOG_FILE" ]]; then
+                    tail -80 "$LOG_FILE"
+                else
+                    warn "Caddy 访问日志已设为 discard（不写磁盘）"
+                    echo "  系统启动日志: /var/log/messages 或 dmesg | grep caddy"
+                fi
+            fi
+            ;;
     esac
 }
 
@@ -826,8 +870,8 @@ rotate_uuid() {
     CORE_SVC=$(proxy_svc_name)
     [[ "${core_type:-xray}" == "singbox" ]] && CORE_CONF="$SBOX_CONF" || CORE_CONF="$XRAY_CONF"
 
-    sed -i "s/${uuid}/${NEW_UUID}/g" "$CORE_CONF"
-    sed -i "s/^uuid=.*/uuid=${NEW_UUID}/"  "$CONF_FILE"
+    sed -i "s/${uuid}/${NEW_UUID}/g"    "$CORE_CONF"
+    sed -i "s/^uuid=.*/uuid=${NEW_UUID}/" "$CONF_FILE"
     service_cmd restart "$CORE_SVC"
     info "UUID 已更换为: ${NEW_UUID}"
     show_config
@@ -835,7 +879,6 @@ rotate_uuid() {
 
 # ═══════════════════════════════════════════════════════════════════
 #  一键卸载
-#  策略：精准移除本脚本组件，不影响其他已安装依赖
 # ═══════════════════════════════════════════════════════════════════
 
 uninstall() {
@@ -851,7 +894,7 @@ uninstall() {
     local CORE_SVC
     CORE_SVC=$(proxy_svc_name)
 
-    # 1. 停止并移除代理核心服务
+    # 1. 停止并移除服务
     step "停止代理核心 (${CORE_SVC})"
     service_cmd stop "$CORE_SVC" 2>/dev/null || true
     if [[ "$INIT_SYS" == "systemd" ]]; then
@@ -863,7 +906,7 @@ uninstall() {
         rm -f "/etc/init.d/${CORE_SVC}"
     fi
 
-    # 2. 移除二进制和配置文件
+    # 2. 移除二进制和配置
     step "移除代理核心文件"
     if [[ "${core_type:-xray}" == "singbox" ]]; then
         rm -f "$SBOX_BIN" "$SBOX_CONF"
@@ -876,20 +919,20 @@ uninstall() {
     rm -f /etc/modules-load.d/vless-bbr.conf
     rm -f /etc/sysctl.d/99-vless-bbr.conf
 
-    # 3. 移除 Caddy 站点配置，恢复主配置
+    # 3. 移除 Caddy 站点配置
     step "移除 Caddy 站点配置"
     rm -f "$CADDY_VLESS_CONF"
     local BACKUP
     BACKUP=$(ls -t "${CADDY_MAIN_CONF}.bak."* 2>/dev/null | head -1)
     if [[ -n "$BACKUP" ]]; then
         cp "$BACKUP" "$CADDY_MAIN_CONF"
-        info "Caddy 主配置已还原自备份: ${BACKUP}"
+        info "Caddy 主配置已还原: ${BACKUP}"
     elif grep -q "vless-personal" "$CADDY_MAIN_CONF" 2>/dev/null; then
         echo "# Caddy config - restored by vless-personal.sh uninstall" > "$CADDY_MAIN_CONF"
     fi
     service_cmd restart caddy 2>/dev/null || true
 
-    # 4. 询问是否卸载 Caddy 本体（仅本脚本安装的才询问）
+    # 4. 询问是否卸载 Caddy 本体
     if [[ "${caddy_preinstalled:-true}" == "false" ]]; then
         echo ""
         read -rp "  Caddy 由本脚本安装，是否一并卸载? [y/N]: " rm_caddy
@@ -911,14 +954,14 @@ uninstall() {
         fi
     fi
 
-    # 5. 清理脚本配置目录和快捷命令
+    # 5. 清理本脚本目录
     step "清理配置"
     rm -rf "$CONF_DIR" "$FAKE_WEBROOT"
     rm -f  "$SHORTCUT"
 
     echo ""
     echo -e "${GREEN}${BOLD}  ✓  卸载完成${NC}"
-    echo -e "  如已启用 BBR，相关内核参数在重启后完全清除"
+    echo -e "  BBR 参数已清除（重启后完全生效）"
     echo ""
 }
 
@@ -941,11 +984,11 @@ do_install() {
     echo -e "${CYAN}${BOLD}════════ VLESS Personal Edition — 安装向导 ════════${NC}"
     echo ""
 
-    # ── 1. 选择代理核心 ──────────────────────────────────────────
+    # ── 选择代理核心 ──────────────────────────────────────────────
     echo -e "${BOLD}  选择代理核心:${NC}"
-    echo "  1) Xray-core   github.com/XTLS/Xray-core"
-    echo "  2) sing-box    github.com/SagerNet/sing-box"
-    local CORE_TYPE CORE_LABEL
+    echo "  1) Xray-core   (github.com/XTLS/Xray-core)"
+    echo "  2) sing-box    (github.com/SagerNet/sing-box)"
+    local CORE_TYPE CORE_LABEL CORE_CHOICE
     while true; do
         read -rp "  输入 [1/2]（默认 1）: " CORE_CHOICE
         CORE_CHOICE="${CORE_CHOICE:-1}"
@@ -957,7 +1000,7 @@ do_install() {
     done
     echo ""
 
-    # ── 2. 收集域名 & 邮箱 ──────────────────────────────────────
+    # ── 收集域名 & 邮箱 ──────────────────────────────────────────
     local INPUT_DOMAIN INPUT_EMAIL
     while true; do
         read -rp "  域名（例: proxy.example.com）: " INPUT_DOMAIN
@@ -965,14 +1008,13 @@ do_install() {
         [[ -n "$INPUT_DOMAIN" && "$INPUT_DOMAIN" =~ ^[a-zA-Z0-9.-]+$ ]] && break
         warn "域名格式不正确，请重新输入"
     done
-
     while true; do
         read -rp "  邮箱（TLS 证书通知）: " INPUT_EMAIL
         [[ "$INPUT_EMAIL" =~ ^[^@]+@[^@]+\.[^@]+$ ]] && break
         warn "邮箱格式不正确"
     done
 
-    # ── 3. 自动生成参数 ─────────────────────────────────────────
+    # ── 自动生成参数 ─────────────────────────────────────────────
     local AUTO_UUID AUTO_PORT AUTO_PATH
     AUTO_UUID=$(gen_uuid)
     AUTO_PORT=$(random_local_port)
@@ -980,11 +1022,11 @@ do_install() {
 
     echo ""
     echo -e "${BOLD}  自动生成配置:${NC}"
-    printf "  %-16s %s\n" "代理核心:" "${CYAN}${CORE_LABEL}${NC}"
-    printf "  %-16s %s\n" "UUID:"     "$AUTO_UUID"
-    printf "  %-16s %s\n" "WS 路径:"  "$AUTO_PATH"
-    printf "  %-16s %s\n" "内部端口:" "127.0.0.1:${AUTO_PORT}"
-    printf "  %-16s %s\n" "外部端口:" "${EXT_PORT} (Caddy TLS)"
+    printf "  %-16s ${CYAN}%s${NC}\n" "代理核心:" "${CORE_LABEL}"
+    printf "  %-16s %s\n"             "UUID:"     "$AUTO_UUID"
+    printf "  %-16s %s\n"             "WS 路径:"  "$AUTO_PATH"
+    printf "  %-16s %s\n"             "内部端口:" "127.0.0.1:${AUTO_PORT}"
+    printf "  %-16s %s\n"             "外部端口:" "${EXT_PORT} (Caddy TLS)"
     echo ""
 
     read -rp "  自定义 UUID? [y/N]: " cu
@@ -1007,7 +1049,7 @@ do_install() {
     read -rp "  启用 BBR 加速? [Y/n]: " bbr_c
     [[ "${bbr_c,,}" == "n" ]] && DO_BBR=false
 
-    # ── 4. 确认 ──────────────────────────────────────────────────
+    # ── 确认 ────────────────────────────────────────────────────
     echo ""
     echo -e "${BOLD}  ── 确认安装参数 ──${NC}"
     printf "  %-16s ${CYAN}%s${NC}\n" "代理核心:" "${CORE_LABEL}"
@@ -1022,20 +1064,22 @@ do_install() {
     read -rp "  确认并开始安装? [Y/n]: " final_c
     [[ "${final_c,,}" == "n" ]] && { info "已取消"; return; }
 
-    # ── 5. 写配置文件 ─────────────────────────────────────────────
+    # ── 写配置文件 ───────────────────────────────────────────────
+    # ⚠ install_date 的值必须加双引号，否则 source 时时间中的空格
+    #   会导致 bash 把 "05:23:57" 当命令执行（command not found）
     mkdir -p "$CONF_DIR"
     cat > "$CONF_FILE" << EOF
-# VLESS Personal Edition 配置（请勿手动修改）
+# VLESS Personal Edition 配置文件（请勿手动修改）
 core_type=${CORE_TYPE}
 domain=${INPUT_DOMAIN}
 email=${INPUT_EMAIL}
 uuid=${AUTO_UUID}
 local_port=${AUTO_PORT}
 ws_path=${AUTO_PATH}
-install_date=$(date '+%Y-%m-%d %H:%M:%S')
+install_date="$(date '+%Y-%m-%d %H:%M:%S')"
 EOF
 
-    # ── 6. 安装各组件 ─────────────────────────────────────────────
+    # ── 安装各组件 ──────────────────────────────────────────────
     install_base_deps
     install_caddy
 
@@ -1054,7 +1098,6 @@ EOF
     $DO_BBR && enable_bbr || true
     setup_shortcut
 
-    # ── 7. 完成提示 ──────────────────────────────────────────────
     echo ""
     echo -e "${GREEN}${BOLD}╔════════════════════════════════════════════════════╗${NC}"
     echo -e "${GREEN}${BOLD}║              ✓  安装完成！                          ║${NC}"
@@ -1062,7 +1105,6 @@ EOF
     echo ""
     echo -e "  ${YELLOW}⚠ 重要：${NC}请确保 ${CYAN}${INPUT_DOMAIN}${NC} 的 DNS A 记录已解析到本机 IP"
     echo -e "  Caddy 通过 HTTP-01 验证申请 Let's Encrypt 证书（约 30~60 秒）"
-    echo -e "  证书申请完成后即可正常连接"
     echo ""
     show_config
 }
@@ -1075,7 +1117,7 @@ main_menu() {
     while true; do
         echo ""
         echo -e "${CYAN}${BOLD}╔══════════════════════════════════════════════════════╗${NC}"
-        echo -e "${CYAN}${BOLD}║     VLESS Personal Edition  v2.0  (vless-p)           ║${NC}"
+        echo -e "${CYAN}${BOLD}║     VLESS Personal Edition  v2.1  (vless-p)           ║${NC}"
         echo -e "${CYAN}${BOLD}╚══════════════════════════════════════════════════════╝${NC}"
 
         if is_installed; then
@@ -1086,7 +1128,7 @@ main_menu() {
                 && xs="${GREEN}运行中${NC}" || xs="${RED}已停止${NC}"
             service_is_active caddy \
                 && cs="${GREEN}运行中${NC}" || cs="${RED}已停止${NC}"
-            echo -e "  核心: ${CYAN}${core_type:-xray}${NC}  $(echo -e $xs)   Caddy: $(echo -e $cs)"
+            printf "  核心: ${CYAN}%s${NC}  $(echo -e $xs)   Caddy: $(echo -e $cs)\n" "${core_type:-xray}"
             echo -e "  ${domain}:${EXT_PORT}  WS: ${ws_path}"
         else
             echo -e "  状态: ${YELLOW}未安装${NC}"
