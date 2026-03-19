@@ -11,6 +11,7 @@
 # ║  下载源:   Xray     → github.com/XTLS/Xray-core/releases         ║
 # ║            sing-box → github.com/SagerNet/sing-box/releases      ║
 # ╚══════════════════════════════════════════════════════════════════╝
+# wget -O vless-go.sh https://raw.githubusercontent.com/SuzukiRenz/ScriptHub/refs/heads/main/SH/vless-go.sh && chmod +x vless-go.sh && ./vless-go.sh
 
 # ── 颜色 ─────────────────────────────────────────────────────────────
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
