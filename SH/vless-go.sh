@@ -722,32 +722,71 @@ setup_services() {
         if [[ "${mode:-ws_tls}" == "ws_tls" ]]; then
             # 先验证 Caddy 配置文件语法
             step "验证 Caddy 配置"
-            if ! caddy validate --config "$CADDY_MAIN_CONF" 2>&1; then
-                warn "Caddy 配置文件存在语法错误，请检查上方输出"
+            local caddy_val_out
+            caddy_val_out=$(caddy validate --config "$CADDY_MAIN_CONF" 2>&1)
+            if echo "$caddy_val_out" | grep -qi "error"; then
+                warn "Caddy 配置存在错误，请检查："
+                echo "$caddy_val_out"
+            else
+                info "Caddy 配置语法正确"
             fi
 
             service_enable caddy
-            info "启动 Caddy（首次申请 Let's Encrypt 证书，约 30~60 秒）..."
+            info "启动 Caddy..."
             systemctl restart caddy
-            sleep 8   # 给 Caddy 足够时间尝试 ACME
+            sleep 3
 
-            # 检查 Caddy 是否成功启动，失败则打印原因
+            # 检查进程是否存活
             if ! systemctl is-active --quiet caddy; then
+                echo -e "${RED}${BOLD}  ✗ Caddy 启动失败，错误原因：${NC}"
+                journalctl -u caddy -n 20 --no-pager 2>/dev/null
                 echo ""
-                echo -e "${RED}${BOLD}  ✗ Caddy 启动失败！以下是错误原因：${NC}"
-                echo -e "${YELLOW}  ─────────────── journalctl ───────────────${NC}"
-                journalctl -u caddy -n 30 --no-pager 2>/dev/null
-                echo -e "${YELLOW}  ─────────────────────────────────────────${NC}"
+                echo -e "  ${YELLOW}常见原因：${NC}"
+                echo "   • 80 端口被云服务商安全组封锁（需在控制台放行）"
+                echo "   • 域名 DNS A 记录未指向本机 IP"
+                warn "Caddy 未运行。修复后执行菜单「4」重启。"
+                return
+            fi
+            info "Caddy 进程已启动，等待 Let's Encrypt 证书申请（最多 90 秒）..."
+
+            # 轮询等待证书申请完成
+            # Caddy 获得真实证书后 8443 才会开始 TLS 握手
+            local waited=0
+            while [[ $waited -lt 90 ]]; do
+                sleep 5; (( waited += 5 ))
+                # 用 openssl 测试 TLS 握手是否能成功
+                local tls_test
+                tls_test=$(echo "Q" | timeout 5 openssl s_client \
+                    -connect "${domain}:${ext_port}" -servername "${domain}" 2>&1)
+                if echo "$tls_test" | grep -q "CONNECTED"; then
+                    # 判断证书来源
+                    if echo "$tls_test" | grep -qi "Let's Encrypt\|letsencrypt\|ZeroSSL"; then
+                        info "✓ Let's Encrypt 证书申请成功（${waited}s）"
+                        break
+                    else
+                        # Caddy 可能在用本地自签名证书过渡，继续等
+                        echo "  等待真实证书... (${waited}s，当前使用临时证书)"
+                    fi
+                else
+                    echo "  等待证书申请... (${waited}s)"
+                fi
+            done
+
+            if [[ $waited -ge 90 ]]; then
                 echo ""
-                echo -e "  ${YELLOW}常见原因及解决方法：${NC}"
-                echo "   • 域名 DNS 未指向本机 IP  → 检查域名 A 记录"
-                echo "   • 80 端口被占用/封锁      → lsof -i:80 或检查云服务商安全组"
-                echo "   • Caddyfile 语法错误      → caddy validate --config ${CADDY_MAIN_CONF}"
-                echo "   • 80 端口防火墙未放行     → ufw allow 80/tcp"
+                echo -e "${YELLOW}  ⚠ 90 秒内未获得 Let's Encrypt 证书${NC}"
+                echo -e "${YELLOW}  可能原因：${NC}"
+                echo "   1. 端口 80 被云服务商安全组封锁（最常见）"
+                echo "      → 登录云控制台，安全组入站规则添加 TCP 80"
+                echo "   2. 频繁安装触发 LE 频率限制（每域名每小时 5 次上限）"
+                echo "      → 等待 1 小时后执行菜单「c」清残留再重装"
+                echo "   3. DNS 未生效（刚改 A 记录需等待传播）"
+                echo "      → 用菜单「5→4」查看当前 DNS 解析状态"
                 echo ""
-                warn "Caddy 未运行，后续连接将失败。修复后执行菜单「4」重启服务。"
-            else
-                info "Caddy 启动成功"
+                echo -e "  ${CYAN}当前 Caddy 日志（关键行）：${NC}"
+                journalctl -u caddy -n 30 --no-pager 2>/dev/null \
+                    | grep -iE "certificate|acme|error|Error|challenge|timeout|rate" \
+                    | tail -10 | sed 's/^/    /'
             fi
         fi
 
@@ -1297,49 +1336,102 @@ show_logs() {
             fi
             ;;
         4)
-            echo -e "${BOLD}  Caddy 配置诊断:${NC}"; hr
-            # 1. 验证配置语法
-            echo -e "${CYAN}[1] 配置文件语法检查:${NC}"
-            caddy validate --config "$CADDY_MAIN_CONF" 2>&1 \
+            load_conf 2>/dev/null
+            echo -e "${BOLD}  Caddy 全量诊断:${NC}"; hr
+
+            # [1] 配置语法
+            echo -e "${CYAN}[1] Caddyfile 语法:${NC}"
+            caddy validate --config "$CADDY_MAIN_CONF" 2>&1 | grep -v "^$" \
                 && echo -e "  ${GREEN}✓ 语法正确${NC}" \
-                || echo -e "  ${RED}✗ 语法错误，请检查上方输出${NC}"
+                || echo -e "  ${RED}✗ 语法错误${NC}"
             echo ""
 
-            # 2. 端口占用检查
-            echo -e "${CYAN}[2] 端口占用检查:${NC}"
-            for p in 80 "${ext_port}"; do
-                if ss -tlnp 2>/dev/null | grep -q ":${p} "; then
-                    local proc; proc=$(ss -tlnp 2>/dev/null | grep ":${p} " | awk '{print $NF}')
-                    echo -e "  :${p}  ${GREEN}已监听${NC}  ${proc}"
+            # [2] 端口监听
+            echo -e "${CYAN}[2] 端口监听:${NC}"
+            for p in 80 "${ext_port:-8443}"; do
+                if ss -tlnp 2>/dev/null | grep -q ":${p}[^0-9]"; then
+                    local proc; proc=$(ss -tlnp 2>/dev/null | awk -v p=":${p}" '$0~p{print $NF}' | head -1)
+                    echo -e "  :${p}  ${GREEN}✓ 已监听${NC}  ($proc)"
                 else
-                    echo -e "  :${p}  ${RED}未监听${NC}"
+                    echo -e "  :${p}  ${RED}✗ 未监听${NC}"
                 fi
             done
             echo ""
 
-            # 3. DNS 解析检查
+            # [3] DNS 解析
             if [[ -n "${domain:-}" ]]; then
-                echo -e "${CYAN}[3] 域名 DNS 解析:${NC}"
-                local resolved; resolved=$(dig +short "${domain}" A 2>/dev/null | head -1 \
-                                           || getent hosts "${domain}" 2>/dev/null | awk '{print $1}' | head -1 \
-                                           || nslookup "${domain}" 2>/dev/null | awk '/^Address:/{print $2}' | grep -v '#' | head -1)
-                local server_ip; server_ip=$(get_server_ip)
-                echo "  域名: ${domain}"
-                echo "  解析到: ${resolved:-（解析失败/超时）}"
+                echo -e "${CYAN}[3] DNS 解析:${NC}"
+                local resolved server_ip
+                resolved=$(getent hosts "${domain}" 2>/dev/null | awk '{print $1}' | head -1 \
+                           || nslookup "${domain}" 2>/dev/null | awk '/^Address:/{print $2}' | grep -v '#' | head -1)
+                server_ip=$(get_server_ip)
+                echo "  域名:   ${domain}"
+                echo "  解析到: ${resolved:-（解析失败）}"
                 echo "  本机IP: ${server_ip}"
                 if [[ -n "$resolved" && "$resolved" == "$server_ip" ]]; then
-                    echo -e "  ${GREEN}✓ DNS 解析正确${NC}"
+                    echo -e "  ${GREEN}✓ DNS 指向正确${NC}"
                 else
-                    echo -e "  ${RED}✗ DNS 未指向本机！ACME 证书申请将失败${NC}"
+                    echo -e "  ${RED}✗ DNS 未指向本机，ACME 验证将失败${NC}"
                 fi
                 echo ""
+
+                # [4] 实测 TLS 握手（这是诊断 ERR_SSL_PROTOCOL_ERROR 的关键）
+                echo -e "${CYAN}[4] TLS 证书实测（openssl s_client）:${NC}"
+                echo "  正在连接 ${domain}:${ext_port:-8443}，请稍候..."
+                local tls_out tls_cert_info
+                tls_out=$(echo "Q" | timeout 8 openssl s_client \
+                    -connect "${domain}:${ext_port:-8443}" \
+                    -servername "${domain}" 2>&1)
+                if echo "$tls_out" | grep -q "CONNECTED"; then
+                    echo -e "  ${GREEN}✓ TLS 握手成功${NC}"
+                    # 证书信息
+                    tls_cert_info=$(echo "$tls_out" | grep -E "issuer=|subject=|NotAfter|Verify return code")
+                    echo "$tls_cert_info" | sed 's/^/    /'
+                    # 判断是否 LE 证书
+                    if echo "$tls_out" | grep -qi "Let's Encrypt\|letsencrypt"; then
+                        echo -e "  ${GREEN}✓ 证书由 Let's Encrypt 签发（正式证书）${NC}"
+                    elif echo "$tls_out" | grep -qi "ZeroSSL"; then
+                        echo -e "  ${GREEN}✓ 证书由 ZeroSSL 签发（正式证书）${NC}"
+                    else
+                        echo -e "  ${YELLOW}⚠ 证书不是来自 LE/ZeroSSL，可能是自签名${NC}"
+                        echo -e "  ${YELLOW}  → 这是 ERR_SSL_PROTOCOL_ERROR 的常见原因${NC}"
+                    fi
+                else
+                    echo -e "  ${RED}✗ TLS 握手失败${NC}"
+                    echo "$tls_out" | grep -E "error|errno|alert|handshake" | head -5 | sed 's/^/    /'
+                    echo -e "  ${YELLOW}这就是浏览器报 ERR_SSL_PROTOCOL_ERROR 的根因${NC}"
+                fi
+                echo ""
+
+                # [5] 检查 LE 频率限制（在 Caddy 日志里找）
+                echo -e "${CYAN}[5] Let's Encrypt 频率限制检测:${NC}"
+                local le_err
+                le_err=$(journalctl -u caddy --no-pager 2>/dev/null \
+                    | grep -iE "too many|rate.limit|rateLimited|429|failed|error" \
+                    | tail -5)
+                if [[ -n "$le_err" ]]; then
+                    echo -e "  ${RED}发现以下错误，可能已触发 LE 频率限制：${NC}"
+                    echo "$le_err" | sed 's/^/    /'
+                    echo ""
+                    echo -e "  ${YELLOW}LE 限制说明：同一域名每小时最多 5 次失败验证${NC}"
+                    echo -e "  ${YELLOW}解决方法：等待 1 小时后执行菜单「c」清残留再重装${NC}"
+                else
+                    echo -e "  ${GREEN}✓ 未发现明显频率限制错误${NC}"
+                fi
+                echo ""
+
+                # [6] 访问地址提示
+                echo -e "${CYAN}[6] 正确的测试地址:${NC}"
+                echo -e "  浏览器应访问: ${GREEN}https://${domain}:${ext_port:-8443}${NC}"
+                echo -e "  （不是 https://${domain}，非标准端口需带上端口号）"
             fi
 
-            # 4. 最近 30 行 Caddy 日志
-            echo -e "${CYAN}[4] Caddy 最近日志（最多 30 行）:${NC}"
-            if [[ "$INIT_SYS" == "systemd" ]]; then
-                journalctl -u caddy -n 30 --no-pager 2>/dev/null || echo "  无日志"
-            fi
+            # [7] Caddy 最近日志（含证书申请状态）
+            echo ""
+            echo -e "${CYAN}[7] Caddy 最近日志（含证书状态）:${NC}"
+            journalctl -u caddy -n 40 --no-pager 2>/dev/null \
+                | grep -E "certificate|tls|acme|error|Error|WARN|INFO" \
+                | tail -20 | sed 's/^/  /'
             hr
             ;;
         5)
