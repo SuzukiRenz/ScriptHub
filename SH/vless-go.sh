@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ╔═══════════════════════════════════════════════════════════════════╗
-# ║          VLESS Personal Edition  v3.1                             ║
+# ║          VLESS Personal Edition  v3.2                             ║
 # ║  支持系统: Debian / Ubuntu / Alpine                                ║
 # ║  代理核心: Xray-core 或 sing-box（安装时选择）                     ║
 # ║  协议模式: VLESS+WS+TLS（需域名）| VLESS+Reality（无需域名）       ║
@@ -708,24 +708,68 @@ setup_services() {
     if [[ "$INIT_SYS" == "systemd" ]]; then
         _write_systemd_unit
         systemctl daemon-reload
+
         if [[ "${mode:-ws_tls}" == "ws_tls" ]]; then
+            # 先验证 Caddy 配置文件语法
+            step "验证 Caddy 配置"
+            if ! caddy validate --config "$CADDY_MAIN_CONF" 2>&1; then
+                warn "Caddy 配置文件存在语法错误，请检查上方输出"
+            fi
+
             service_enable caddy
             info "启动 Caddy（首次申请 Let's Encrypt 证书，约 30~60 秒）..."
             systemctl restart caddy
-            sleep 6
+            sleep 8   # 给 Caddy 足够时间尝试 ACME
+
+            # 检查 Caddy 是否成功启动，失败则打印原因
+            if ! systemctl is-active --quiet caddy; then
+                echo ""
+                echo -e "${RED}${BOLD}  ✗ Caddy 启动失败！以下是错误原因：${NC}"
+                echo -e "${YELLOW}  ─────────────── journalctl ───────────────${NC}"
+                journalctl -u caddy -n 30 --no-pager 2>/dev/null
+                echo -e "${YELLOW}  ─────────────────────────────────────────${NC}"
+                echo ""
+                echo -e "  ${YELLOW}常见原因及解决方法：${NC}"
+                echo "   • 域名 DNS 未指向本机 IP  → 检查域名 A 记录"
+                echo "   • 80 端口被占用/封锁      → lsof -i:80 或检查云服务商安全组"
+                echo "   • Caddyfile 语法错误      → caddy validate --config ${CADDY_MAIN_CONF}"
+                echo "   • 80 端口防火墙未放行     → ufw allow 80/tcp"
+                echo ""
+                warn "Caddy 未运行，后续连接将失败。修复后执行菜单「4」重启服务。"
+            else
+                info "Caddy 启动成功"
+            fi
         fi
+
         service_enable "$CORE_SVC"
         systemctl restart "$CORE_SVC"
+        sleep 2
+        if ! systemctl is-active --quiet "$CORE_SVC"; then
+            echo -e "${RED}  ✗ ${CORE_SVC} 启动失败：${NC}"
+            journalctl -u "${CORE_SVC}" -n 20 --no-pager 2>/dev/null
+        else
+            info "${CORE_SVC} 启动成功"
+        fi
+
     else
+        # OpenRC（Alpine）
         _write_openrc_unit
         if [[ "${mode:-ws_tls}" == "ws_tls" ]]; then
+            caddy validate --config "$CADDY_MAIN_CONF" 2>&1 || warn "Caddy 配置语法错误"
             service_enable caddy
             rc-service caddy restart
-            sleep 6
+            sleep 8
+            if ! rc-service caddy status 2>/dev/null | grep -q started; then
+                echo -e "${RED}  ✗ Caddy 启动失败${NC}"
+                tail -30 /var/log/caddy.log 2>/dev/null || true
+            else
+                info "Caddy 启动成功"
+            fi
         fi
         service_enable "$CORE_SVC"
         rc-service "$CORE_SVC" start
     fi
+
     info "服务配置完成"
 }
 
@@ -1165,9 +1209,27 @@ restart_services() {
     local CORE_SVC
     CORE_SVC=$(proxy_svc_name)
     step "重启服务"
-    [[ "${mode:-ws_tls}" == "ws_tls" ]] && { service_cmd restart caddy; sleep 2; }
+
+    if [[ "${mode:-ws_tls}" == "ws_tls" ]]; then
+        # 先验证配置
+        caddy validate --config "$CADDY_MAIN_CONF" 2>&1 | grep -i "error\|warn" && \
+            warn "Caddy 配置存在问题，见上方输出" || true
+        service_cmd restart caddy
+        sleep 4
+        if ! service_is_active caddy; then
+            echo -e "${RED}  ✗ Caddy 重启失败，最近日志：${NC}"
+            [[ "$INIT_SYS" == "systemd" ]] && journalctl -u caddy -n 20 --no-pager 2>/dev/null
+        else
+            info "Caddy 已重启"
+        fi
+    fi
+
     service_cmd restart "$CORE_SVC"
-    info "服务已重启"; show_status
+    sleep 2
+    service_is_active "$CORE_SVC" && info "${CORE_SVC} 已重启" \
+        || { echo -e "${RED}  ✗ ${CORE_SVC} 重启失败：${NC}"
+             [[ "$INIT_SYS" == "systemd" ]] && journalctl -u "${CORE_SVC}" -n 20 --no-pager 2>/dev/null; }
+    show_status
 }
 
 # ═══════════════════════════════════════════════════════════════════
@@ -1180,22 +1242,99 @@ show_logs() {
     echo ""
     echo "  1) ${CORE_SVC} 日志（最近 80 行）"
     echo "  2) ${CORE_SVC} 错误上下文（journalctl -xe）"
-    echo "  3) Caddy 日志"
-    echo "  4) 流量操作日志"
+    echo "  3) Caddy 系统日志（journalctl，含启动错误）"
+    echo "  4) Caddy 配置诊断（validate + 端口/DNS 检查）"
+    echo "  5) 流量操作日志"
     echo "  0) 返回"
-    read -rp "  选择 [0-4]: " lc; echo ""
+    read -rp "  选择 [0-5]: " lc; echo ""
+
     case "$lc" in
-        1) [[ "$INIT_SYS" == "systemd" ]] \
-               && journalctl -u "${CORE_SVC}" -n 80 --no-pager 2>/dev/null \
-               || tail -80 "/var/log/${CORE_SVC}.log" 2>/dev/null \
-               || warn "暂无日志，请确认服务已启动" ;;
-        2) [[ "$INIT_SYS" == "systemd" ]] \
-               && journalctl -xe -u "${CORE_SVC}" --no-pager 2>/dev/null \
-               || warn "journalctl -xe 仅 systemd 可用" ;;
-        3) [[ "$INIT_SYS" == "systemd" ]] \
-               && journalctl -u caddy -n 80 --no-pager 2>/dev/null \
-               || warn "Caddy 访问日志已设为 discard（节省磁盘）" ;;
-        4) tail -50 "$LOG_FILE" 2>/dev/null || echo "暂无流量操作日志" ;;
+        1)
+            if [[ "$INIT_SYS" == "systemd" ]]; then
+                journalctl -u "${CORE_SVC}" -n 80 --no-pager 2>/dev/null \
+                    || echo "  无日志，服务可能尚未启动"
+            else
+                local f="/var/log/${CORE_SVC}.log"
+                if [[ -f "$f" ]]; then tail -80 "$f"
+                else warn "日志文件 ${f} 不存在，请确认服务已启动"; fi
+            fi
+            ;;
+        2)
+            if [[ "$INIT_SYS" == "systemd" ]]; then
+                journalctl -xe -u "${CORE_SVC}" --no-pager 2>/dev/null \
+                    || echo "  无日志"
+            else
+                warn "journalctl -xe 仅 systemd 可用"
+            fi
+            ;;
+        3)
+            # 注意：log{output discard} 只关闭"访问日志"文件
+            # 服务启动/错误日志始终写入 journalctl / stderr，这里是正确入口
+            echo -e "${BOLD}  Caddy 服务日志（journalctl）:${NC}"
+            if [[ "$INIT_SYS" == "systemd" ]]; then
+                # 显式使用 if，避免 &&/|| 在 journalctl 无输出时误触 warn
+                if journalctl -u caddy -n 100 --no-pager 2>/dev/null; then
+                    true   # 成功，什么都不做
+                else
+                    warn "journalctl 查询失败，caddy 单元可能不存在"
+                    echo "  请手动执行: journalctl -u caddy -n 100 --no-pager"
+                fi
+            else
+                # Alpine: Caddy 的 stderr 被 OpenRC 重定向到日志文件
+                local cf="/var/log/caddy.log"
+                if [[ -f "$cf" ]]; then tail -80 "$cf"
+                else warn "日志文件 ${cf} 不存在"; fi
+            fi
+            ;;
+        4)
+            echo -e "${BOLD}  Caddy 配置诊断:${NC}"; hr
+            # 1. 验证配置语法
+            echo -e "${CYAN}[1] 配置文件语法检查:${NC}"
+            caddy validate --config "$CADDY_MAIN_CONF" 2>&1 \
+                && echo -e "  ${GREEN}✓ 语法正确${NC}" \
+                || echo -e "  ${RED}✗ 语法错误，请检查上方输出${NC}"
+            echo ""
+
+            # 2. 端口占用检查
+            echo -e "${CYAN}[2] 端口占用检查:${NC}"
+            for p in 80 "${ext_port}"; do
+                if ss -tlnp 2>/dev/null | grep -q ":${p} "; then
+                    local proc; proc=$(ss -tlnp 2>/dev/null | grep ":${p} " | awk '{print $NF}')
+                    echo -e "  :${p}  ${GREEN}已监听${NC}  ${proc}"
+                else
+                    echo -e "  :${p}  ${RED}未监听${NC}"
+                fi
+            done
+            echo ""
+
+            # 3. DNS 解析检查
+            if [[ -n "${domain:-}" ]]; then
+                echo -e "${CYAN}[3] 域名 DNS 解析:${NC}"
+                local resolved; resolved=$(dig +short "${domain}" A 2>/dev/null | head -1 \
+                                           || getent hosts "${domain}" 2>/dev/null | awk '{print $1}' | head -1 \
+                                           || nslookup "${domain}" 2>/dev/null | awk '/^Address:/{print $2}' | grep -v '#' | head -1)
+                local server_ip; server_ip=$(get_server_ip)
+                echo "  域名: ${domain}"
+                echo "  解析到: ${resolved:-（解析失败/超时）}"
+                echo "  本机IP: ${server_ip}"
+                if [[ -n "$resolved" && "$resolved" == "$server_ip" ]]; then
+                    echo -e "  ${GREEN}✓ DNS 解析正确${NC}"
+                else
+                    echo -e "  ${RED}✗ DNS 未指向本机！ACME 证书申请将失败${NC}"
+                fi
+                echo ""
+            fi
+
+            # 4. 最近 30 行 Caddy 日志
+            echo -e "${CYAN}[4] Caddy 最近日志（最多 30 行）:${NC}"
+            if [[ "$INIT_SYS" == "systemd" ]]; then
+                journalctl -u caddy -n 30 --no-pager 2>/dev/null || echo "  无日志"
+            fi
+            hr
+            ;;
+        5)
+            tail -50 "$LOG_FILE" 2>/dev/null || echo "暂无流量操作日志"
+            ;;
     esac
 }
 
@@ -1547,7 +1686,7 @@ main_menu() {
     while true; do
         echo ""
         echo -e "${CYAN}${BOLD}╔════════════════════════════════════════════════════════╗${NC}"
-        echo -e "${CYAN}${BOLD}║      VLESS Personal Edition  v3.1  (vless-p)            ║${NC}"
+        echo -e "${CYAN}${BOLD}║      VLESS Personal Edition  v3.2  (vless-p)            ║${NC}"
         echo -e "${CYAN}${BOLD}╚════════════════════════════════════════════════════════╝${NC}"
 
         if is_installed; then
