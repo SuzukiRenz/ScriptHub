@@ -566,60 +566,53 @@ configure_caddy() {
     step "生成 Caddy 配置"
     mkdir -p "$CADDY_CONF_DIR"
 
-    # 备份已有主配置（仅首次）
     if [[ -f "$CADDY_MAIN_CONF" ]] && ! grep -q "vless-personal" "$CADDY_MAIN_CONF" 2>/dev/null; then
         cp "$CADDY_MAIN_CONF" "${CADDY_MAIN_CONF}.bak.$(date +%s)"
         info "原 Caddyfile 已备份"
     fi
 
-    # 主配置：全局块
-    # 不在全局块指定 servers{protocols}，避免与 WebSocket HTTP/1.1 升级冲突
+    # 主配置 —— 与 v2.1 能工作的版本完全一致
     cat > "$CADDY_MAIN_CONF" << EOF
 {
     email ${email}
     admin off
+    servers {
+        protocols h1 h2
+    }
 }
 
 import ${CADDY_VLESS_CONF}
 EOF
 
-    # 站点配置
-    # 关键设计：
-    # ① 不手动指定 tls 密码套件 → 让 Caddy 使用经过测试的默认值
-    #   手动指定 ciphers 会导致部分客户端（iOS/安卓）TLS 握手超时
-    # ② WS 匹配器只用 path，不检测 Upgrade header
-    #   原因：Upgrade header 值在不同客户端大小写不一致（websocket/WebSocket）
-    #   Caddy 的 reverse_proxy 会自动处理 101 Switching Protocols 升级
-    # ③ 路径伪装：非 WS 请求访问代理路径返回 404
-    #   用 @not_ws 反向匹配器代替 handle path（避免优先级冲突）
+    # 站点配置 —— 与 v2.1 能工作的版本完全一致
+    # 注意：保留 tls{} 块和 ciphers（v2.1 就是这样能工作的）
+    # 注意：保留 X-Forwarded-For（只是 WARN 不是 ERROR，不影响功能）
+    # 注意：handle path 只用路径匹配，不检测 Upgrade header
     cat > "$CADDY_VLESS_CONF" << EOF
 ${domain}:${ext_port} {
 
-    # ① WS 代理路径 → 转发给代理核心（sing-box / xray 明文 WS）
+    tls {
+        protocols tls1.2 tls1.3
+        ciphers TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384 TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384 TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256 TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256 TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256 TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256
+    }
+
     handle ${ws_path} {
         reverse_proxy 127.0.0.1:${local_port} {
-            header_up Host      {host}
-            header_up X-Real-IP {remote_host}
-            # 保持长连接，立即刷新流量
+            header_up Host            {host}
+            header_up X-Real-IP       {remote_host}
+            header_up X-Forwarded-For {remote_host}
             flush_interval -1
-            # 强制 HTTP/1.1：WebSocket 握手不兼容 HTTP/2
             transport http {
                 versions 1.1
             }
         }
     }
 
-    # ② 其余路径 → 伪装 nginx 静态页面
     handle {
         root * ${FAKE_WEBROOT}
-        file_server {
-            hide .* _*
-        }
-        header {
-            Server "nginx/1.24.0"
-            -X-Powered-By
-            -X-Caddy-Version
-        }
+        file_server
+        header Server "nginx/1.24.0"
+        header -X-Powered-By
     }
 
     log {
@@ -628,22 +621,8 @@ ${domain}:${ext_port} {
 }
 EOF
 
-    # 自动格式化，消除 "not formatted" 警告
-    caddy fmt --overwrite "$CADDY_MAIN_CONF"  2>/dev/null || true
-    caddy fmt --overwrite "$CADDY_VLESS_CONF" 2>/dev/null || true
-
     info "Caddy 主配置: ${CADDY_MAIN_CONF}"
     info "站点配置:     ${CADDY_VLESS_CONF}"
-
-    # 验证配置语法
-    local validate_out
-    validate_out=$(caddy validate --config "$CADDY_MAIN_CONF" 2>&1)
-    if echo "$validate_out" | grep -qi "error"; then
-        warn "Caddy 配置验证发现问题："
-        echo "$validate_out"
-    else
-        info "Caddy 配置语法验证通过"
-    fi
 }
 
 # ═══════════════════════════════════════════════════════════════════
@@ -720,23 +699,11 @@ setup_services() {
         systemctl daemon-reload
 
         if [[ "${mode:-ws_tls}" == "ws_tls" ]]; then
-            # 先验证 Caddy 配置文件语法
-            step "验证 Caddy 配置"
-            local caddy_val_out
-            caddy_val_out=$(caddy validate --config "$CADDY_MAIN_CONF" 2>&1)
-            if echo "$caddy_val_out" | grep -qi "error"; then
-                warn "Caddy 配置存在错误，请检查："
-                echo "$caddy_val_out"
-            else
-                info "Caddy 配置语法正确"
-            fi
-
             service_enable caddy
-            info "启动 Caddy..."
+            info "启动 Caddy（首次申请 Let's Encrypt 证书，约 30~60 秒）..."
             systemctl restart caddy
-            sleep 3
+            sleep 5
 
-            # 检查进程是否存活
             if ! systemctl is-active --quiet caddy; then
                 echo -e "${RED}${BOLD}  ✗ Caddy 启动失败，错误原因：${NC}"
                 journalctl -u caddy -n 20 --no-pager 2>/dev/null
@@ -745,48 +712,8 @@ setup_services() {
                 echo "   • 80 端口被云服务商安全组封锁（需在控制台放行）"
                 echo "   • 域名 DNS A 记录未指向本机 IP"
                 warn "Caddy 未运行。修复后执行菜单「4」重启。"
-                return
-            fi
-            info "Caddy 进程已启动，等待 Let's Encrypt 证书申请（最多 90 秒）..."
-
-            # 轮询等待证书申请完成
-            # Caddy 获得真实证书后 8443 才会开始 TLS 握手
-            local waited=0
-            while [[ $waited -lt 90 ]]; do
-                sleep 5; (( waited += 5 ))
-                # 用 openssl 测试 TLS 握手是否能成功
-                local tls_test
-                tls_test=$(echo "Q" | timeout 5 openssl s_client \
-                    -connect "${domain}:${ext_port}" -servername "${domain}" 2>&1)
-                if echo "$tls_test" | grep -q "CONNECTED"; then
-                    # 判断证书来源
-                    if echo "$tls_test" | grep -qi "Let's Encrypt\|letsencrypt\|ZeroSSL"; then
-                        info "✓ Let's Encrypt 证书申请成功（${waited}s）"
-                        break
-                    else
-                        # Caddy 可能在用本地自签名证书过渡，继续等
-                        echo "  等待真实证书... (${waited}s，当前使用临时证书)"
-                    fi
-                else
-                    echo "  等待证书申请... (${waited}s)"
-                fi
-            done
-
-            if [[ $waited -ge 90 ]]; then
-                echo ""
-                echo -e "${YELLOW}  ⚠ 90 秒内未获得 Let's Encrypt 证书${NC}"
-                echo -e "${YELLOW}  可能原因：${NC}"
-                echo "   1. 端口 80 被云服务商安全组封锁（最常见）"
-                echo "      → 登录云控制台，安全组入站规则添加 TCP 80"
-                echo "   2. 频繁安装触发 LE 频率限制（每域名每小时 5 次上限）"
-                echo "      → 等待 1 小时后执行菜单「c」清残留再重装"
-                echo "   3. DNS 未生效（刚改 A 记录需等待传播）"
-                echo "      → 用菜单「5→4」查看当前 DNS 解析状态"
-                echo ""
-                echo -e "  ${CYAN}当前 Caddy 日志（关键行）：${NC}"
-                journalctl -u caddy -n 30 --no-pager 2>/dev/null \
-                    | grep -iE "certificate|acme|error|Error|challenge|timeout|rate" \
-                    | tail -10 | sed 's/^/    /'
+            else
+                info "Caddy 启动成功"
             fi
         fi
 
@@ -804,13 +731,15 @@ setup_services() {
         # OpenRC（Alpine）
         _write_openrc_unit
         if [[ "${mode:-ws_tls}" == "ws_tls" ]]; then
-            caddy validate --config "$CADDY_MAIN_CONF" 2>&1 || warn "Caddy 配置语法错误"
             service_enable caddy
+            info "启动 Caddy（首次申请 Let's Encrypt 证书，约 30~60 秒）..."
             rc-service caddy restart
-            sleep 8
+            sleep 5
             if ! rc-service caddy status 2>/dev/null | grep -q started; then
                 echo -e "${RED}  ✗ Caddy 启动失败${NC}"
-                tail -30 /var/log/caddy.log 2>/dev/null || true
+                tail -30 /var/log/caddy.log 2>/dev/null \
+                    || echo "  日志: /var/log/caddy.log 不存在，请检查 OpenRC 配置"
+                echo -e "  ${YELLOW}常见原因：80 端口被封 / DNS 未指向本机${NC}"
             else
                 info "Caddy 启动成功"
             fi
