@@ -580,8 +580,11 @@ configure_caddy() {
 {
     email ${email}
     admin off
-    servers { protocols h1 h2 }
+    servers {
+        protocols h1 h2
+    }
 }
+
 import ${CADDY_VLESS_CONF}
 EOF
 
@@ -612,7 +615,9 @@ ${domain}:${ext_port} {
             header_up X-Forwarded-For {remote_host}
             flush_interval -1
             # 强制 HTTP/1.1，WebSocket 不支持 HTTP/2
-            transport http { versions 1.1 }
+            transport http {
+                versions 1.1
+            }
         }
     }
 
@@ -629,8 +634,10 @@ ${domain}:${ext_port} {
         header -X-Powered-By
     }
 
-    # 关闭访问日志（减少磁盘 IO，避免泄露访问记录）
-    log { output discard }
+    # 关闭访问日志（减少磁盘 IO）
+    log {
+        output discard
+    }
 }
 EOF
     info "Caddy 主配置: ${CADDY_MAIN_CONF}"
@@ -657,7 +664,8 @@ Wants=network-online.target
 [Service]
 Type=simple
 User=root
-ExecStartPre=${CONF_DIR}/restore-iptables.sh
+# - 前缀：脚本不存在或失败时不阻止主进程启动
+ExecStartPre=-${CONF_DIR}/restore-iptables.sh
 ExecStart=${BIN} ${EXEC_ARGS}
 Restart=on-failure
 RestartSec=5s
@@ -689,7 +697,7 @@ command_background=true
 pidfile="/run/${CORE_SVC}.pid"
 output_log="/var/log/${CORE_SVC}.log"
 error_log="/var/log/${CORE_SVC}.log"
-start_pre() { ${CONF_DIR}/restore-iptables.sh; }
+start_pre() { [ -x "${CONF_DIR}/restore-iptables.sh" ] && ${CONF_DIR}/restore-iptables.sh; }
 depend() { need net; ${AFTER_DEPS}; }
 RCEOF
     chmod +x "/etc/init.d/${CORE_SVC}"
@@ -1798,9 +1806,13 @@ EOF
         configure_caddy
     fi
 
+    # ⚠ 必须在 setup_services 之前：
+    #   systemd 单元的 ExecStartPre 指向 restore-iptables.sh，
+    #   该脚本由 setup_traffic_monitoring 创建，若顺序颠倒
+    #   服务启动时找不到脚本会直接失败（即使加了 - 前缀也应确保存在）
+    setup_traffic_monitoring
     setup_services
     setup_firewall
-    setup_traffic_monitoring
     $DO_BBR && enable_bbr || true
     setup_shortcut
 
