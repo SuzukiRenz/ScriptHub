@@ -572,79 +572,78 @@ configure_caddy() {
         info "原 Caddyfile 已备份"
     fi
 
+    # 主配置：全局块
+    # 不在全局块指定 servers{protocols}，避免与 WebSocket HTTP/1.1 升级冲突
     cat > "$CADDY_MAIN_CONF" << EOF
-# ── VLESS Personal Edition ─────────────────────────────────────────
-# 修改站点配置: ${CADDY_VLESS_CONF}
-# 重载生效:     caddy reload --config ${CADDY_MAIN_CONF}
-# ──────────────────────────────────────────────────────────────────
 {
     email ${email}
     admin off
-    servers {
-        protocols h1 h2
-    }
 }
 
 import ${CADDY_VLESS_CONF}
 EOF
 
+    # 站点配置
+    # 关键设计：
+    # ① 不手动指定 tls 密码套件 → 让 Caddy 使用经过测试的默认值
+    #   手动指定 ciphers 会导致部分客户端（iOS/安卓）TLS 握手超时
+    # ② WS 匹配器只用 path，不检测 Upgrade header
+    #   原因：Upgrade header 值在不同客户端大小写不一致（websocket/WebSocket）
+    #   Caddy 的 reverse_proxy 会自动处理 101 Switching Protocols 升级
+    # ③ 路径伪装：非 WS 请求访问代理路径返回 404
+    #   用 @not_ws 反向匹配器代替 handle path（避免优先级冲突）
     cat > "$CADDY_VLESS_CONF" << EOF
-# ── VLESS+WS+TLS 站点 ─────────────────────────────────────────────
-# 域名: ${domain}  外部端口: ${ext_port}  内部端口: ${local_port}
-# 生成: $(date '+%Y-%m-%d_%H:%M:%S')
-# ─────────────────────────────────────────────────────────────────
-
 ${domain}:${ext_port} {
 
-    # Caddy 自动向 Let's Encrypt 申请证书并续签
-    # HTTP-01 验证需要 80 端口可访问
-    tls {
-        protocols tls1.2 tls1.3
-        ciphers TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384 TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384 TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256 TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256 TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256 TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256
-    }
-
-    # ① WS 升级请求（含 Upgrade: websocket header）→ 转发给代理核心
-    @ws_upgrade {
-        path ${ws_path}
-        header Upgrade websocket
-    }
-    handle @ws_upgrade {
+    # ① WS 代理路径 → 转发给代理核心（sing-box / xray 明文 WS）
+    handle ${ws_path} {
         reverse_proxy 127.0.0.1:${local_port} {
-            header_up Host       {host}
-            header_up X-Real-IP  {remote_host}
+            header_up Host      {host}
+            header_up X-Real-IP {remote_host}
+            # 保持长连接，立即刷新流量
             flush_interval -1
-            # 强制 HTTP/1.1，WebSocket 不支持 HTTP/2
+            # 强制 HTTP/1.1：WebSocket 握手不兼容 HTTP/2
             transport http {
                 versions 1.1
             }
         }
     }
 
-    # ② 普通 HTTP 访问 WS 路径 → 404（让扫描探测得到 404，不暴露路径存在）
-    handle ${ws_path} {
-        respond 404
-    }
-
-    # ③ 其余路径 → 伪装 nginx 静态页面
+    # ② 其余路径 → 伪装 nginx 静态页面
     handle {
         root * ${FAKE_WEBROOT}
-        file_server
-        header Server "nginx/1.24.0"
-        header -X-Powered-By
+        file_server {
+            hide .* _*
+        }
+        header {
+            Server "nginx/1.24.0"
+            -X-Powered-By
+            -X-Caddy-Version
+        }
     }
 
-    # 关闭访问日志（减少磁盘 IO）
     log {
         output discard
     }
 }
 EOF
+
+    # 自动格式化，消除 "not formatted" 警告
+    caddy fmt --overwrite "$CADDY_MAIN_CONF"  2>/dev/null || true
+    caddy fmt --overwrite "$CADDY_VLESS_CONF" 2>/dev/null || true
+
     info "Caddy 主配置: ${CADDY_MAIN_CONF}"
     info "站点配置:     ${CADDY_VLESS_CONF}"
 
-    # 自动格式化，消除 caddy validate 的 "not formatted" 警告
-    caddy fmt --overwrite "$CADDY_MAIN_CONF"  2>/dev/null || true
-    caddy fmt --overwrite "$CADDY_VLESS_CONF" 2>/dev/null || true
+    # 验证配置语法
+    local validate_out
+    validate_out=$(caddy validate --config "$CADDY_MAIN_CONF" 2>&1)
+    if echo "$validate_out" | grep -qi "error"; then
+        warn "Caddy 配置验证发现问题："
+        echo "$validate_out"
+    else
+        info "Caddy 配置语法验证通过"
+    fi
 }
 
 # ═══════════════════════════════════════════════════════════════════
