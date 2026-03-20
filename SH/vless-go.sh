@@ -610,9 +610,8 @@ ${domain}:${ext_port} {
     }
     handle @ws_upgrade {
         reverse_proxy 127.0.0.1:${local_port} {
-            header_up Host            {host}
-            header_up X-Real-IP       {remote_host}
-            header_up X-Forwarded-For {remote_host}
+            header_up Host       {host}
+            header_up X-Real-IP  {remote_host}
             flush_interval -1
             # 强制 HTTP/1.1，WebSocket 不支持 HTTP/2
             transport http {
@@ -642,6 +641,10 @@ ${domain}:${ext_port} {
 EOF
     info "Caddy 主配置: ${CADDY_MAIN_CONF}"
     info "站点配置:     ${CADDY_VLESS_CONF}"
+
+    # 自动格式化，消除 caddy validate 的 "not formatted" 警告
+    caddy fmt --overwrite "$CADDY_MAIN_CONF"  2>/dev/null || true
+    caddy fmt --overwrite "$CADDY_VLESS_CONF" 2>/dev/null || true
 }
 
 # ═══════════════════════════════════════════════════════════════════
