@@ -1359,10 +1359,131 @@ rotate_uuid() {
 #  一键卸载（精准移除本脚本组件，不影响其他依赖）
 # ═══════════════════════════════════════════════════════════════════
 
+# ═══════════════════════════════════════════════════════════════════
+#  彻底清除所有残留（不卸载 Caddy/核心二进制本身）
+#  用于多次测试安装后留下的配置碎片
+# ═══════════════════════════════════════════════════════════════════
+
+purge_residual() {
+    echo ""
+    echo -e "${RED}${BOLD}  ⚠  彻底清除所有残留配置${NC}"
+    echo ""
+    echo "  将清除以下内容："
+    echo "  • 所有 Caddyfile 备份（/etc/caddy/Caddyfile.bak.*）"
+    echo "  • vless-personal 站点配置（/etc/caddy/vless-personal.Caddyfile）"
+    echo "  • Caddy ACME 证书缓存（/var/lib/caddy / ~/.local/share/caddy）"
+    echo "  • 本脚本配置目录（/etc/vless-personal/）"
+    echo "  • xray / sing-box 配置文件（二进制本身保留）"
+    echo "  • iptables VLESS 计数链"
+    echo "  • cron 任务"
+    echo "  • 伪装网站目录"
+    echo ""
+    echo "  不会影响："
+    echo "  • Caddy 本体"
+    echo "  • xray / sing-box 二进制"
+    echo "  • 其他 Caddy 站点（若有）"
+    echo ""
+    read -rp "  确认彻底清除? [y/N]: " confirm
+    [[ "${confirm,,}" == "y" ]] || { info "已取消"; return; }
+
+    # ── 停止所有相关服务 ──────────────────────────────────────────
+    step "停止服务"
+    for svc in xray sing-box caddy; do
+        service_cmd stop "$svc" 2>/dev/null || true
+    done
+
+    # ── 移除 systemd / openrc 单元 ───────────────────────────────
+    step "清理服务单元"
+    if [[ "$INIT_SYS" == "systemd" ]]; then
+        for svc in xray sing-box; do
+            systemctl disable "$svc" 2>/dev/null || true
+            rm -f "/etc/systemd/system/${svc}.service"
+        done
+        systemctl daemon-reload 2>/dev/null || true
+    else
+        for svc in xray sing-box; do
+            rc-update del "$svc" default 2>/dev/null || true
+            rm -f "/etc/init.d/${svc}"
+        done
+    fi
+
+    # ── 清理 Caddy 配置（所有备份 + vless 站点块）────────────────
+    step "清理 Caddy 配置"
+    rm -f  "$CADDY_VLESS_CONF"
+    rm -f  "${CADDY_CONF_DIR}"/Caddyfile.bak.*
+    # 将主 Caddyfile 重置为最简空配置（不删，避免 caddy 包升级覆写 /etc）
+    cat > "$CADDY_MAIN_CONF" << 'EOF'
+# Caddyfile - reset by vless-personal purge
+# 重新安装 vless-personal 后此文件将被覆写
+EOF
+    info "Caddyfile 已重置，历史备份已删除"
+
+    # ── 清理 Caddy ACME 证书缓存 ──────────────────────────────────
+    # Caddy 默认存储路径（systemd 环境 vs 手动运行）
+    step "清理 Caddy ACME 缓存（旧证书申请失败状态）"
+    local acme_dirs=(
+        "/var/lib/caddy/.local/share/caddy"
+        "/var/lib/caddy"
+        "/root/.local/share/caddy"
+        "/home/caddy/.local/share/caddy"
+    )
+    for d in "${acme_dirs[@]}"; do
+        if [[ -d "$d" ]]; then
+            rm -rf "$d"
+            info "已清除: ${d}"
+        fi
+    done
+
+    # ── 清理代理核心配置（保留二进制）────────────────────────────
+    step "清理代理核心配置"
+    rm -f  "$XRAY_CONF"; rmdir "$XRAY_CONF_DIR" 2>/dev/null || true
+    rm -f  "$SBOX_CONF"; rmdir "$SBOX_CONF_DIR" 2>/dev/null || true
+    rm -rf /usr/local/share/xray
+
+    # ── 清理 iptables 计数链 ──────────────────────────────────────
+    step "清理 iptables"
+    # 移除所有可能遗留的端口跳转规则（遍历常见 TLS 端口）
+    for port in 443 8443 2053 2083 2087 2096; do
+        while iptables -D INPUT  -p tcp --dport "$port" -j VLESS_IN  2>/dev/null; do true; done
+        while iptables -D OUTPUT -p tcp --sport "$port" -j VLESS_OUT 2>/dev/null; do true; done
+    done
+    iptables -F VLESS_IN  2>/dev/null || true; iptables -X VLESS_IN  2>/dev/null || true
+    iptables -F VLESS_OUT 2>/dev/null || true; iptables -X VLESS_OUT 2>/dev/null || true
+
+    # ── 清理 cron ────────────────────────────────────────────────
+    step "清理 Cron"
+    if [[ "$OS_ID" == "alpine" ]]; then
+        sed -i '/vless-personal/d' /etc/crontabs/root 2>/dev/null || true
+    else
+        rm -f /etc/cron.d/vless-personal
+    fi
+
+    # ── 清理本脚本目录 ────────────────────────────────────────────
+    step "清理脚本配置"
+    rm -rf "$CONF_DIR" "$FAKE_WEBROOT"
+    rm -f  "$LOG_FILE"
+    rm -f  /etc/modules-load.d/vless-bbr.conf
+    rm -f  /etc/sysctl.d/99-vless-bbr.conf
+
+    echo ""
+    echo -e "${GREEN}${BOLD}  ✓  清除完成${NC}"
+    echo ""
+    echo -e "  现在可以执行菜单「1」重新全新安装。"
+    echo -e "  ${YELLOW}注意：${NC}重装前请确认："
+    echo "    1. 域名 DNS A 记录已指向本机 IP"
+    echo "    2. 服务器 80 端口（云服务商安全组）已放行"
+    echo "    3. 本机防火墙（ufw/iptables）已允许 80 和目标端口"
+    echo ""
+}
+
+# ═══════════════════════════════════════════════════════════════════
+#  正常卸载（保留 Caddy 本体，可选）
+# ═══════════════════════════════════════════════════════════════════
+
 uninstall() {
     echo ""
     echo -e "${RED}${BOLD}  ⚠  即将卸载 VLESS Personal Edition${NC}"
-    echo -e "  将移除: 代理核心 + 配置 + 流量监控 + Cron 任务"
+    echo -e "  将移除: 代理核心 + 配置 + 流量监控 + Cron 任务 + Caddy 备份 + ACME 缓存"
     echo -e "  不影响: Caddy 本体（若非本脚本安装）+ 其他系统依赖"
     echo ""
     read -rp "  确认卸载? [y/N]: " confirm
@@ -1371,7 +1492,7 @@ uninstall() {
     load_conf 2>/dev/null || true
     local CORE_SVC; CORE_SVC=$(proxy_svc_name)
 
-    # 1. 停止并移除服务
+    # 1. 停止并移除服务单元
     step "停止代理服务"
     service_cmd stop "$CORE_SVC" 2>/dev/null || true
     if [[ "$INIT_SYS" == "systemd" ]]; then
@@ -1383,55 +1504,76 @@ uninstall() {
         rm -f "/etc/init.d/${CORE_SVC}"
     fi
 
-    # 2. 移除二进制和配置
+    # 2. 移除代理核心二进制和配置
     step "移除核心文件"
     if [[ "${core_type:-xray}" == "singbox" ]]; then
         rm -f "$SBOX_BIN" "$SBOX_CONF"; rmdir "$SBOX_CONF_DIR" 2>/dev/null || true
     else
-        rm -f "$XRAY_BIN" "$XRAY_CONF"; rm -rf /usr/local/share/xray; rmdir "$XRAY_CONF_DIR" 2>/dev/null || true
+        rm -f "$XRAY_BIN" "$XRAY_CONF"; rm -rf /usr/local/share/xray
+        rmdir "$XRAY_CONF_DIR" 2>/dev/null || true
     fi
     rm -f /etc/modules-load.d/vless-bbr.conf /etc/sysctl.d/99-vless-bbr.conf
 
-    # 3. 清理 iptables 计数链
+    # 3. 清理 iptables 计数链（遍历所有可能端口，防止残留）
     step "清理 iptables"
-    while iptables -D INPUT  -p tcp --dport "${ext_port}" -j VLESS_IN  2>/dev/null; do true; done
-    while iptables -D OUTPUT -p tcp --sport "${ext_port}" -j VLESS_OUT 2>/dev/null; do true; done
+    for port in 443 8443 2053 2083 2087 2096 "${ext_port:-8443}"; do
+        while iptables -D INPUT  -p tcp --dport "$port" -j VLESS_IN  2>/dev/null; do true; done
+        while iptables -D OUTPUT -p tcp --sport "$port" -j VLESS_OUT 2>/dev/null; do true; done
+    done
     iptables -F VLESS_IN  2>/dev/null || true; iptables -X VLESS_IN  2>/dev/null || true
     iptables -F VLESS_OUT 2>/dev/null || true; iptables -X VLESS_OUT 2>/dev/null || true
 
     # 4. 清理 Cron 任务
     step "清理 Cron"
-    [[ "$OS_ID" == "alpine" ]] && sed -i '/vless-personal/d' /etc/crontabs/root 2>/dev/null || rm -f /etc/cron.d/vless-personal
+    if [[ "$OS_ID" == "alpine" ]]; then
+        sed -i '/vless-personal/d' /etc/crontabs/root 2>/dev/null || true
+    else
+        rm -f /etc/cron.d/vless-personal
+    fi
 
-    # 5. 移除 Caddy 站点配置
-    if [[ "${mode:-ws_tls}" == "ws_tls" ]]; then
-        step "移除 Caddy 站点配置"
-        rm -f "$CADDY_VLESS_CONF"
-        local BACKUP
-        BACKUP=$(ls -t "${CADDY_MAIN_CONF}.bak."* 2>/dev/null | head -1)
-        if [[ -n "$BACKUP" ]]; then
-            cp "$BACKUP" "$CADDY_MAIN_CONF"; info "Caddy 主配置已从备份还原"
-        elif grep -q "vless-personal" "$CADDY_MAIN_CONF" 2>/dev/null; then
-            echo "# Caddy config - restored by vless-personal.sh" > "$CADDY_MAIN_CONF"
-        fi
-        service_cmd restart caddy 2>/dev/null || true
+    # 5. 清理 Caddy 站点配置、所有备份和 ACME 缓存
+    step "清理 Caddy 配置与缓存"
+    rm -f "$CADDY_VLESS_CONF"
+    # 删除所有历史备份（多次安装生成的 .bak.* 文件）
+    rm -f "${CADDY_CONF_DIR}"/Caddyfile.bak.*
+    info "已删除所有 Caddyfile 备份"
 
-        if [[ "${caddy_preinstalled:-true}" == "false" ]]; then
-            echo ""
-            read -rp "  Caddy 由本脚本安装，是否一并卸载? [y/N]: " rm_caddy
-            if [[ "${rm_caddy,,}" == "y" ]]; then
-                service_cmd stop caddy 2>/dev/null || true
-                [[ "$INIT_SYS" == "systemd" ]] && systemctl disable caddy 2>/dev/null || rc-update del caddy default 2>/dev/null
-                [[ "$PKG_MGR" == "apt" ]] \
-                    && { apt-get remove -y caddy 2>/dev/null; rm -f /etc/apt/sources.list.d/caddy-stable.list /usr/share/keyrings/caddy-stable-archive-keyring.gpg; } \
-                    || apk del caddy 2>/dev/null || true
-                info "Caddy 已卸载"
+    # 重置主 Caddyfile（不还原备份，备份本身可能就是问题所在）
+    if grep -q "vless-personal" "$CADDY_MAIN_CONF" 2>/dev/null; then
+        cat > "$CADDY_MAIN_CONF" << 'EOF'
+# Caddyfile - reset by vless-personal uninstall
+EOF
+    fi
+
+    # 清理 ACME 证书缓存（旧的失败申请会阻止重新申请）
+    for d in "/var/lib/caddy/.local/share/caddy" "/var/lib/caddy" \
+              "/root/.local/share/caddy" "/home/caddy/.local/share/caddy"; do
+        [[ -d "$d" ]] && { rm -rf "$d"; info "已清除 ACME 缓存: ${d}"; }
+    done
+
+    service_cmd restart caddy 2>/dev/null || true
+
+    if [[ "${caddy_preinstalled:-true}" == "false" ]]; then
+        echo ""
+        read -rp "  Caddy 由本脚本安装，是否一并卸载? [y/N]: " rm_caddy
+        if [[ "${rm_caddy,,}" == "y" ]]; then
+            service_cmd stop caddy 2>/dev/null || true
+            [[ "$INIT_SYS" == "systemd" ]] \
+                && systemctl disable caddy 2>/dev/null \
+                || rc-update del caddy default 2>/dev/null
+            if [[ "$PKG_MGR" == "apt" ]]; then
+                apt-get remove -y caddy 2>/dev/null || true
+                rm -f /etc/apt/sources.list.d/caddy-stable.list
+                rm -f /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+            else
+                apk del caddy 2>/dev/null || true
             fi
+            info "Caddy 已卸载"
         fi
     fi
 
-    # 6. 清理所有配置目录
-    step "清理配置"
+    # 6. 清理本脚本所有目录
+    step "清理配置目录"
     rm -rf "$CONF_DIR" "$FAKE_WEBROOT"
     rm -f  "$SHORTCUT" "$LOG_FILE"
 
@@ -1700,10 +1842,12 @@ main_menu() {
             printf "  核心: ${CYAN}%s${NC}(%s) 状态: " "${core_type:-xray}" "$mode_str"
             echo -e "$(echo -e $xs)"
             printf "  端口: ${CYAN}%s${NC}" "${ext_port:-8443}"
-            [[ "${mode:-ws_tls}" == "ws_tls" ]] \
-                && printf "   域名: %s  WS: %s  Caddy: " "${domain}" "${ws_path}" \
-                && echo -e "$(echo -e $cs)" \
-                || { printf "   伪装: %s\n" "${reality_dest}"; }
+            if [[ "${mode:-ws_tls}" == "ws_tls" ]]; then
+                printf "   域名: %s  WS: %s  Caddy: " "${domain}" "${ws_path}"
+                echo -e "$(echo -e $cs)"
+            else
+                printf "   伪装: %s\n" "${reality_dest}"
+            fi
             local tlimit="${traffic_limit_gb:-0}"
             [[ "$tlimit" -gt 0 ]] && {
                 local used_str="流量: $(human_bytes "${traffic_bytes_total:-0}") / ${tlimit}GB"
@@ -1719,14 +1863,15 @@ main_menu() {
         echo "  2) 查看配置 / 链接"
         echo "  3) 服务状态"
         echo "  4) 重启服务"
-        echo "  5) 查看日志"
+        echo "  5) 查看日志 / Caddy 诊断"
         echo "  6) 更换 UUID"
         echo "  7) 流量统计 / 手动重置"
         echo "  8) 中转/转发设置"
         echo "  9) 一键卸载"
+        echo -e "  ${YELLOW}c) 彻底清除所有残留（反复安装后残留修复）${NC}"
         echo "  0) 退出"
         hr
-        read -rp "  请选择 [0-9]: " choice
+        read -rp "  请选择 [0-9/c]: " choice
         case "$choice" in
             1) do_install       ;;
             2) show_config      ;;
@@ -1740,8 +1885,9 @@ main_menu() {
                [[ "${_rst,,}" == "y" ]] && reset_traffic_manual ;;
             8) manage_relay     ;;
             9) uninstall        ;;
+            c|C) purge_residual ;;
             0) echo "  再见！"; exit 0 ;;
-            *) warn "无效选项，请输入 0-9" ;;
+            *) warn "无效选项，请输入 0-9 或 c" ;;
         esac
     done
 }
