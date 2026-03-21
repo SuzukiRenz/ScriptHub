@@ -561,25 +561,87 @@ EOF
 #  ③ 其余所有路径                               → 返回 nginx 伪装页面
 # ═══════════════════════════════════════════════════════════════════
 
+
 configure_caddy() {
     load_conf || error "配置文件不存在"
-    step "生成 Caddy 配置"
+    step "生成 Caddy 配置（Patched）"
     mkdir -p "$CADDY_CONF_DIR"
 
+    # ACME storage and permissions
+    install -d -o caddy -g caddy /var/lib/caddy 2>/dev/null || install -d /var/lib/caddy || true
+    chown -R caddy:caddy /var/lib/caddy 2>/dev/null || true
+
+    # Backup existing Caddyfile once (if looked like user-managed)
     if [[ -f "$CADDY_MAIN_CONF" ]] && ! grep -q "vless-personal" "$CADDY_MAIN_CONF" 2>/dev/null; then
         cp "$CADDY_MAIN_CONF" "${CADDY_MAIN_CONF}.bak.$(date +%s)"
         info "原 Caddyfile 已备份"
     fi
 
-    # 主配置 —— 与 v2.1 能工作的版本完全一致
+    # Global block
     cat > "$CADDY_MAIN_CONF" << EOF
 {
     email ${email}
     admin off
+    http_port 80
+    https_port ${ext_port}
+    storage file_system {
+        root /var/lib/caddy
+    }
     servers {
         protocols h1 h2
     }
 }
+
+import ${CADDY_VLESS_CONF}
+EOF
+
+    # Site block with strict WS match and 404 for normal GET
+    cat > "$CADDY_VLESS_CONF" << EOF
+${domain}:${ext_port} {
+
+    tls {
+        protocols tls1.2 tls1.3
+        ciphers TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384 TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384 TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256 TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256 TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256 TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256
+    }
+
+    @ws {
+        header Connection *Upgrade*
+        header Upgrade websocket
+        path ${ws_path}
+    }
+    handle @ws {
+        reverse_proxy 127.0.0.1:${local_port} {
+            header_up Host            {host}
+            header_up X-Real-IP       {remote_host}
+            header_up X-Forwarded-For {remote_host}
+            flush_interval -1
+            transport http { versions 1.1 }
+        }
+    }
+
+    handle_path ${ws_path}* {
+        respond "Not Found" 404
+    }
+
+    handle {
+        root * ${FAKE_WEBROOT}
+        file_server
+        header Server "nginx/1.24.0"
+        header -X-Powered-By
+    }
+
+    log { output discard }
+}
+EOF
+
+    # Validate
+    if command -v caddy >/dev/null 2>&1; then
+        if ! caddy validate --config "$CADDY_MAIN_CONF"; then
+            error "Caddy 配置校验失败，请检查输出"
+        fi
+    fi
+}
+
 
 import ${CADDY_VLESS_CONF}
 EOF
