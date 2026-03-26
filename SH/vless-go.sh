@@ -187,7 +187,7 @@ install_base_deps() {
     if [[ "$PKG_MGR" == "apt" ]]; then
         pkg_install curl wget unzip tar iproute2 openssl ca-certificates gnupg lsb-release iptables cron
     else
-        pkg_install curl wget unzip tar iproute2 openssl ca-certificates util-linux iptables dcron
+        pkg_install curl wget unzip tar iproute2 openssl ca-certificates util-linux iptables dcron gcompat
     fi
     info "基础依赖完成"
 }
@@ -254,7 +254,7 @@ install_xray() {
 
 install_singbox() {
     step "安装 sing-box"
-    local ARCH TMP VER VER_NUM PKG URL
+    local ARCH TMP VER VER_NUM PKG URL LDD
     ARCH=$(sbox_arch); TMP=$(mktemp -d)
     info "查询最新稳定版本（过滤 alpha/beta/rc）..."
     VER=$(curl -s --max-time 10 "https://api.github.com/repos/SagerNet/sing-box/releases" \
@@ -268,6 +268,15 @@ install_singbox() {
     wget -qO "${TMP}/sing-box.tar.gz" "$URL" || error "sing-box 下载失败，请检查网络"
     tar -xzf "${TMP}/sing-box.tar.gz" -C "${TMP}/"
     install -m 755 "${TMP}/${PKG}/sing-box" "$SBOX_BIN"
+
+    # Alpine glibc 兼容处理（避免 'cannot execute: required file not found'）
+    if [[ "$PKG_MGR" == "apk" ]]; then
+        LDD=$(ldd "$SBOX_BIN" 2>&1 || true)
+        if echo "$LDD" | grep -qi "ld-linux"; then
+            pkg_install gcompat || true
+        fi
+    fi
+
     rm -rf "$TMP"
     info "sing-box 安装完成: $("$SBOX_BIN" version 2>&1 | head -1)"
 }
