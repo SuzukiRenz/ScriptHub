@@ -167,12 +167,113 @@ else
 fi
 
 # ─────────────────────────────────────────────
+# 检测当前 SSH 连接端口（UFW 安全放行用）
+# ─────────────────────────────────────────────
+
+# 方法1：从当前 SSH 会话环境变量读取（最可靠）
+detect_ssh_port() {
+    _port=""
+
+    # $SSH_CLIENT = "客户端IP 客户端端口 服务器端口"
+    if [ -n "$SSH_CLIENT" ]; then
+        _port=$(echo "$SSH_CLIENT" | awk '{print $3}')
+    fi
+
+    # $SSH_CONNECTION = "客户端IP 客户端端口 服务器IP 服务器端口"
+    if [ -z "$_port" ] && [ -n "$SSH_CONNECTION" ]; then
+        _port=$(echo "$SSH_CONNECTION" | awk '{print $4}')
+    fi
+
+    # 方法2：从 sshd_config 读取 Port 指令
+    if [ -z "$_port" ]; then
+        for _cfg in /etc/ssh/sshd_config /etc/sshd_config; do
+            if [ -f "$_cfg" ]; then
+                _port=$(grep -i "^Port " "$_cfg" 2>/dev/null | awk '{print $2}' | head -1)
+                [ -n "$_port" ] && break
+            fi
+        done
+    fi
+
+    # 方法3：从 ss/netstat 检测 sshd 监听端口
+    if [ -z "$_port" ] && cmd_exists ss; then
+        _port=$(ss -tlnp 2>/dev/null | grep sshd | awk '{print $4}' | grep -o '[0-9]*$' | head -1)
+    fi
+
+    # 兜底默认值
+    echo "${_port:-22}"
+}
+
+# ─────────────────────────────────────────────
+# 安全启用 UFW（先放行 SSH 再 enable）
+# ─────────────────────────────────────────────
+safe_enable_ufw() {
+    # ── 第一步：探测 SSH 端口 ──────────────────
+    _detected_port=$(detect_ssh_port)
+    printf "\n"
+    printf "${YELLOW}┌─────────────────────────────────────────────────┐${NC}\n"
+    printf "${YELLOW}│  ⚠️  UFW 安全检查 — 防止 SSH 连接被锁门         │${NC}\n"
+    printf "${YELLOW}└─────────────────────────────────────────────────┘${NC}\n"
+    info "自动检测到 SSH 端口：${BOLD}${_detected_port}${NC}"
+    ask "请确认/修改 SSH 端口（直接回车使用检测值 ${_detected_port}）:"
+    read -r _confirm_port
+    SSH_FW_PORT="${_confirm_port:-$_detected_port}"
+
+    # ── 第二步：展示将要执行的操作，二次确认 ──
+    printf "\n"
+    info "UFW 启用前将执行以下操作："
+    printf "  ${CYAN}①${NC} ufw allow ${SSH_FW_PORT}/tcp   ${YELLOW}# 放行 SSH 端口，防止断线${NC}\n"
+    printf "  ${CYAN}②${NC} ufw default deny incoming      ${YELLOW}# 默认拒绝所有入站${NC}\n"
+    printf "  ${CYAN}③${NC} ufw default allow outgoing     ${YELLOW}# 默认允许所有出站${NC}\n"
+    printf "  ${CYAN}④${NC} ufw --force enable             ${YELLOW}# 启用 UFW${NC}\n"
+    printf "\n"
+    warn "启用后，除 SSH(${SSH_FW_PORT}) 外所有入站端口将被拒绝，请确认其他服务端口已放行！"
+    printf "\n"
+
+    # 询问是否还有其他需要放行的端口
+    ask "是否需要额外放行其他端口？（留空跳过，多个用空格分隔，例: 80 443 8080）:"
+    read -r _extra_ports
+
+    # 再次确认
+    printf "\n"
+    if ! prompt_yn "确认以上操作无误，现在启用 UFW？" "n"; then
+        warn "已取消 UFW 启用。切换为 iptables 模式继续..."
+        install_pkg "iptables"
+        HAS_IPTABLES=1
+        return 1
+    fi
+
+    # ── 第三步：按顺序安全执行 ────────────────
+    # 先放行 SSH，绝对第一步
+    ufw allow "${SSH_FW_PORT}/tcp" comment 'SSH - added by setup_fail2ban.sh' >/dev/null 2>&1
+    success "已放行 SSH 端口：${SSH_FW_PORT}/tcp"
+
+    # 放行额外端口
+    if [ -n "$_extra_ports" ]; then
+        for _p in $_extra_ports; do
+            ufw allow "$_p" comment 'Extra - added by setup_fail2ban.sh' >/dev/null 2>&1
+            success "已放行额外端口：$_p"
+        done
+    fi
+
+    # 设置默认策略
+    ufw default deny incoming  >/dev/null 2>&1
+    ufw default allow outgoing >/dev/null 2>&1
+
+    # 最后才 enable
+    ufw --force enable >/dev/null 2>&1
+    success "UFW 已启用，当前规则："
+    ufw status numbered 2>/dev/null | head -20
+    return 0
+}
+
+# ─────────────────────────────────────────────
 # 检测防火墙后端
 # ─────────────────────────────────────────────
 step "检测防火墙后端"
 
 BANACTION="iptables-multiport"   # 默认
 BANACTION_ALLPORTS="iptables-allports"
+SSH_FW_PORT="22"   # 供摘要显示用，safe_enable_ufw 内会更新
 
 HAS_UFW=0
 HAS_IPTABLES=0
@@ -180,7 +281,9 @@ HAS_NFTABLES=0
 
 if cmd_exists ufw && ufw status 2>/dev/null | grep -q "Status: active"; then
     HAS_UFW=1
-    info "检测到 UFW 已启用"
+    info "检测到 UFW 已启用（active）"
+elif cmd_exists ufw; then
+    info "检测到 UFW 已安装但未启用"
 fi
 
 if cmd_exists iptables; then
@@ -195,44 +298,66 @@ fi
 
 # 选择 banaction
 if [ "$HAS_UFW" -eq 1 ]; then
+    # UFW 已经是 active 状态，直接使用
     BANACTION="ufw"
     BANACTION_ALLPORTS="ufw"
-    success "防火墙后端：UFW"
+    success "防火墙后端：UFW（已激活）"
 elif [ "$HAS_NFTABLES" -eq 1 ] && [ "$HAS_IPTABLES" -eq 0 ]; then
     BANACTION="nftables-multiport"
     BANACTION_ALLPORTS="nftables-allports"
     success "防火墙后端：nftables"
+elif [ "$HAS_IPTABLES" -eq 1 ]; then
+    success "防火墙后端：iptables"
 else
-    if [ "$HAS_IPTABLES" -eq 1 ]; then
-        success "防火墙后端：iptables"
-    else
-        warn "未检测到任何防火墙工具（iptables / ufw / nftables）"
-        printf "请选择要安装的防火墙：\n"
-        printf "  1) iptables（推荐，更广泛兼容）\n"
-        printf "  2) ufw（适合 Debian/Ubuntu，界面友好）\n"
-        printf "  3) 跳过（不安装防火墙，使用 fail2ban 软封禁）\n"
-        ask "请输入选项 [1/2/3]（默认 1）:"
-        read -r FW_CHOICE
-        FW_CHOICE="${FW_CHOICE:-1}"
-        case "$FW_CHOICE" in
-            1)
-                install_pkg "iptables"
-                HAS_IPTABLES=1
-                ;;
-            2)
+    warn "未检测到任何已激活的防火墙工具（iptables / ufw / nftables）"
+    printf "\n请选择要安装/启用的防火墙：\n"
+    printf "  ${BOLD}1)${NC} iptables ${CYAN}（推荐）${NC}\n"
+    printf "       安装后默认放行所有流量，fail2ban 动态追加封禁规则\n"
+    printf "       ${GREEN}✓ 不会锁门，最安全的选择${NC}\n"
+    printf "\n"
+    printf "  ${BOLD}2)${NC} ufw ${YELLOW}（需谨慎）${NC}\n"
+    printf "       启用后默认拒绝所有入站，脚本会自动检测 SSH 端口并先放行\n"
+    printf "       ${YELLOW}⚠ 会展示操作预览并要求二次确认，防止锁门${NC}\n"
+    printf "\n"
+    printf "  ${BOLD}3)${NC} 跳过 ${RED}（仅记录，不封禁）${NC}\n"
+    printf "       fail2ban 软封禁模式，触发时只写日志不实际阻断流量\n"
+    printf "\n"
+    ask "请输入选项 [1/2/3]（默认 1）:"
+    read -r FW_CHOICE
+    FW_CHOICE="${FW_CHOICE:-1}"
+    case "$FW_CHOICE" in
+        1)
+            install_pkg "iptables"
+            HAS_IPTABLES=1
+            # iptables 安装后默认 ACCEPT，无需额外操作
+            success "iptables 已安装，默认策略 ACCEPT，不影响现有连接"
+            ;;
+        2)
+            # UFW 可能已安装但未激活，也可能需要安装
+            if ! cmd_exists ufw; then
                 install_pkg "ufw"
-                ufw --force enable >/dev/null 2>&1
+            fi
+            # 安全启用（内部处理 SSH 放行 + 二次确认）
+            if safe_enable_ufw; then
                 HAS_UFW=1
                 BANACTION="ufw"
                 BANACTION_ALLPORTS="ufw"
-                ;;
-            3)
-                warn "跳过防火墙安装，将使用软封禁模式（仅记录，不实际阻断）"
-                BANACTION="dummy"
-                BANACTION_ALLPORTS="dummy"
-                ;;
-        esac
-    fi
+            else
+                # 用户取消 UFW，已在函数内切换到 iptables
+                success "防火墙后端：iptables（UFW 取消后自动切换）"
+            fi
+            ;;
+        3)
+            warn "跳过防火墙安装，将使用软封禁模式（fail2ban 仅记录日志，不实际阻断）"
+            BANACTION="dummy"
+            BANACTION_ALLPORTS="dummy"
+            ;;
+        *)
+            warn "无效选项，默认使用 iptables"
+            install_pkg "iptables"
+            HAS_IPTABLES=1
+            ;;
+    esac
 fi
 
 # ─────────────────────────────────────────────
