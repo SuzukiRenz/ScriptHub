@@ -4,6 +4,7 @@
 # 支持系统：Debian/Ubuntu、Alpine Linux
 # 功能：自动检测依赖、日志路径、防火墙类型，生成保守的 fail2ban 配置
 # =============================================================================
+# wget -O setup_fail2ban.sh https://raw.githubusercontent.com/SuzukiRenz/ScriptHub/refs/heads/main/SH/setup_fail2ban.sh && chmod +x setup_fail2ban.sh && ./setup_fail2ban.sh
 
 set -e
 
