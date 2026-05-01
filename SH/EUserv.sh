@@ -70,7 +70,7 @@ from typing import Dict, List, Tuple, Optional
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from PIL import Image
+from PIL import Image, ImageEnhance, ImageFilter, ImageOps
 import pytesseract
 import requests
 from bs4 import BeautifulSoup
@@ -123,57 +123,108 @@ ACCOUNTS = [
 ]
 
 def recognize_and_calculate(captcha_image_url: str, session: requests.Session) -> Optional[str]:
-    """使用 pytesseract 识别验证码（数学运算或字符串），无 AVX 依赖"""
-    DIGIT_CORRECTIONS = {'O': '0', 'o': '0', 'D': '0', 'Q': '0', 'I': '1', 'i': '1', 'l': '1', '|': '1', 'Z': '2', 'z': '2', 'S': '5', 's': '5', 'G': '6', 'b': '6', 'B': '8', 'g': '8'}
-    OPERATOR_CORRECTIONS = {'x': '×', 'X': '×', '*': '×', '×': '×', '÷': '/', ':': '/', '+': '+', '-': '-', '/': '/'}
+    """使用 pytesseract 识别验证码（数学运算或字符串），带多策略预处理和投票。"""
+    DIGIT_CORRECTIONS = {'O': '0', 'o': '0', 'D': '0', 'Q': '0', 'I': '1', 'i': '1', 'l': '1', '|': '1', '!': '1', 'Z': '2', 'z': '2', 'S': '5', 's': '5', 'G': '6', 'b': '6', 'B': '8', 'g': '8'}
+    OPERATOR_CORRECTIONS = {'x': '×', 'X': '×', '*': '×', '×': '×', '÷': '/', ':': '/', '+': '+', '-': '-', '—': '-', '–': '-', '/': '/'}
 
     def fix_digit(c):
         if c.isdigit(): return c
         return DIGIT_CORRECTIONS.get(c, DIGIT_CORRECTIONS.get(c.upper(), c))
 
-    try:
-        response = session.get(captcha_image_url)
-        img = Image.open(io.BytesIO(response.content)).convert('RGB')
+    def clean_text(text: str) -> str:
+        text = text.replace(' ', '').replace('\n', '').replace('\r', '').replace('=', '')
+        text = re.sub(r'[^0-9A-Za-z+\-*/×÷:|!]', '', text)
+        return text
 
-        # 提取绿色数字，过滤背景噪点
+    def parse_candidate(raw: str) -> Optional[str]:
+        raw = clean_text(raw)
+        if not raw:
+            return None
+
+        # 优先解析数学验证码。支持 7+3、7x3、7/3 等，也兼容 OCR 多识别一个字符的情况。
+        m = re.search(r'([0-9OoDQIl|!ZzSsGgbB])([+\-xX*×÷/:])([0-9OoDQIl|!ZzSsGgbB])', raw)
+        if m:
+            left_c = fix_digit(m.group(1))
+            op_c = OPERATOR_CORRECTIONS.get(m.group(2), m.group(2))
+            right_c = fix_digit(m.group(3))
+            try:
+                result = calculate_operation(int(left_c), op_c, int(right_c), raw)
+                if result is not None:
+                    return result
+            except (ValueError, IndexError):
+                pass
+
+        # 如果 OCR 只识别出纯数字，且长度合理，直接返回。
+        normalized = ''.join(fix_digit(c) for c in raw)
+        if normalized.isdigit() and 1 <= len(normalized) <= 6:
+            return normalized
+
+        # 纯字符串验证码兜底。
+        if len(raw) >= 6:
+            return raw.upper()
+        return None
+
+    def green_mask(src: Image.Image, mode: str) -> Image.Image:
+        img = src.convert('RGB')
         pixels = img.load()
         width, height = img.size
         for x in range(width):
             for y in range(height):
                 r, g, b = pixels[x, y]
-                if not (r > 200 and 100 < g < 220 and b < 80):
-                    pixels[x, y] = (255, 255, 255)
+                if mode == 'green_strict':
+                    keep = (r > 170 and 80 < g < 235 and b < 120 and r > g + 20 and r > b + 80)
+                elif mode == 'green_loose':
+                    keep = (r > 140 and g > 60 and b < 160 and r > b + 45)
+                else:
+                    keep = True
+                pixels[x, y] = (0, 0, 0) if keep else (255, 255, 255)
+        return img
 
-        # 放大 + 二值化，提升 tesseract 识别率
-        img = img.resize((width * 3, height * 3), Image.LANCZOS)
-        img = img.convert('L').point(lambda v: 0 if v < 180 else 255, '1')
+    def preprocess_variants(src: Image.Image) -> List[Image.Image]:
+        variants = []
+        base_variants = [green_mask(src, 'green_strict'), green_mask(src, 'green_loose'), src.convert('RGB')]
+        for base in base_variants:
+            gray = ImageOps.grayscale(base)
+            gray = ImageEnhance.Contrast(gray).enhance(2.5)
+            gray = gray.filter(ImageFilter.MedianFilter(size=3))
+            for scale in (3, 4, 5):
+                enlarged = gray.resize((gray.width * scale, gray.height * scale), Image.Resampling.LANCZOS)
+                for threshold in (120, 150, 180, 205):
+                    bw = enlarged.point(lambda v, t=threshold: 0 if v < t else 255, 'L')
+                    variants.append(bw)
+                    variants.append(ImageOps.invert(bw))
+        return variants
 
-        # tesseract：只识别数字和运算符
-        custom_cfg = r'--oem 1 --psm 8 -c tessedit_char_whitelist=0123456789+-×÷xX*/='
-        text = pytesseract.image_to_string(img, config=custom_cfg).strip()
-        raw = text.replace(' ', '').replace('\n', '')
-        logger.debug(f"tesseract 原始识别: {repr(raw)}")
+    try:
+        response = session.get(captcha_image_url, timeout=15)
+        response.raise_for_status()
+        src = Image.open(io.BytesIO(response.content)).convert('RGB')
 
-        if not raw:
+        candidates: List[str] = []
+        configs = [
+            r'--oem 1 --psm 7 -c tessedit_char_whitelist=0123456789+-×÷xX*/:=OoDQIl|!ZzSsGgbB',
+            r'--oem 1 --psm 8 -c tessedit_char_whitelist=0123456789+-×÷xX*/:=OoDQIl|!ZzSsGgbB',
+            r'--oem 1 --psm 13 -c tessedit_char_whitelist=0123456789+-×÷xX*/:=OoDQIl|!ZzSsGgbB',
+        ]
+
+        for img in preprocess_variants(src):
+            for cfg in configs:
+                raw = pytesseract.image_to_string(img, config=cfg).strip()
+                parsed = parse_candidate(raw)
+                if parsed:
+                    candidates.append(parsed)
+
+        if not candidates:
+            logger.warning("验证码 OCR 未产生有效候选")
             return None
 
-        # 纯字符串验证码（>=6位，如 EUserv 的 token 类）
-        if len(raw) >= 6:
-            return raw.upper()
-
-        # 数学运算验证码：尝试解析 A op B
-        if len(raw) >= 3:
-            left_c = fix_digit(raw[0])
-            op_c   = OPERATOR_CORRECTIONS.get(raw[1], raw[1])
-            right_c = fix_digit(raw[2])
-            try:
-                result = calculate_operation(int(left_c), op_c, int(right_c), raw)
-                if result:
-                    return result
-            except (ValueError, IndexError):
-                pass
-
-        return raw.upper()
+        # 多预处理结果投票。平票时取最短数字结果，降低把噪声当字符串提交的概率。
+        counts = {}
+        for c in candidates:
+            counts[c] = counts.get(c, 0) + 1
+        best = sorted(counts.items(), key=lambda kv: (-kv[1], len(kv[0]), kv[0]))[0][0]
+        logger.info(f"验证码候选: {counts}，采用: {best}")
+        return best
     except Exception as e:
         logger.error(f"验证码异常: {e}")
         return None
@@ -234,16 +285,29 @@ class EUserv:
             
             if 'captcha' in response.text.lower():
                 logger.info("⚠️ 需要验证码，正在识别...")
-                for attempt in range(10):
-                    if attempt > 0: time.sleep(3)
-                    captcha_code = recognize_and_calculate(captcha_url, self.session)
-                    if not captcha_code: return False
+                captcha_ok = False
+                max_captcha_retries = int(os.getenv("CAPTCHA_MAX_RETRIES", "6"))
+                retry_delay = int(os.getenv("CAPTCHA_RETRY_DELAY", "4"))
+                for attempt in range(1, max_captcha_retries + 1):
+                    if attempt > 1:
+                        time.sleep(retry_delay)
+                    # 给验证码 URL 加时间戳，避免缓存导致重复识别同一张失败图片。
+                    captcha_fetch_url = f"{captcha_url}?t={int(time.time() * 1000)}&try={attempt}"
+                    captcha_code = recognize_and_calculate(captcha_fetch_url, self.session)
+                    if not captcha_code:
+                        logger.warning(f"验证码第 {attempt}/{max_captcha_retries} 次识别失败，准备重试")
+                        continue
+                    logger.info(f"验证码第 {attempt}/{max_captcha_retries} 次提交候选: {captcha_code}")
                     captcha_data = {'subaction': 'login', 'sess_id': sess_id, 'captcha_code': captcha_code}
                     response = self.session.post(url, headers=headers, data=captcha_data)
                     if 'captcha' not in response.text.lower():
                         soup = BeautifulSoup(response.text, "html.parser")
+                        captcha_ok = True
                         break
-                    elif attempt == 9: return False
+                    logger.warning(f"验证码第 {attempt}/{max_captcha_retries} 次被拒绝")
+                if not captcha_ok:
+                    logger.error(f"验证码识别达到上限 {max_captcha_retries} 次，停止本轮登录")
+                    return False
             
             if 'PIN that you receive via email' in response.text:
                 c_id_input = soup.find("input", {"name": "c_id"})
@@ -501,6 +565,39 @@ PYTHON_EOF
 # ---------------------------------------------------------
 configure_env() {
     print_info "配置环境变量..."
+
+    if [[ -f "${CONFIG_FILE}" ]]; then
+        print_warning "检测到已有配置文件：${CONFIG_FILE}"
+        echo "1) 沿用旧配置（推荐：只更新脚本和依赖，不覆盖账号信息）"
+        echo "2) 重新输入配置（先备份旧配置，再覆盖）"
+        echo "3) 退出，不做修改"
+        local cfg_choice
+        read -p "请选择 [1/2/3]（默认 1）: " cfg_choice
+        cfg_choice="${cfg_choice:-1}"
+        case "$cfg_choice" in
+            1)
+                print_success "已沿用旧配置"
+                ensure_config_defaults
+                return
+                ;;
+            2)
+                local bak_file="${CONFIG_FILE}.bak.$(date +%Y%m%d%H%M%S)"
+                cp "${CONFIG_FILE}" "${bak_file}"
+                chmod 600 "${bak_file}" 2>/dev/null || true
+                print_success "旧配置已备份：${bak_file}"
+                ;;
+            3)
+                print_info "已退出，未修改配置"
+                exit 0
+                ;;
+            *)
+                print_warning "无效选择，默认沿用旧配置"
+                ensure_config_defaults
+                return
+                ;;
+        esac
+    fi
+
     read -p "请输入EUserv账号邮箱: " email
     read -sp "请输入EUserv账号密码: " password
     echo ""
@@ -512,16 +609,26 @@ configure_env() {
     read -p "Telegram Bot Token: " tg_bot_token
     read -p "Telegram Chat ID: " tg_chat_id
     echo ""
-    
+
     cat > ${CONFIG_FILE} <<EOF
 EUSERV_EMAIL=${email}
 EUSERV_PASSWORD=${password}
 EMAIL_PASS=${email_pass}
 TG_BOT_TOKEN=${tg_bot_token}
 TG_CHAT_ID=${tg_chat_id}
+CAPTCHA_MAX_RETRIES=6
+CAPTCHA_RETRY_DELAY=4
 TZ=Asia/Shanghai
 EOF
     chmod 600 ${CONFIG_FILE}
+}
+
+ensure_config_defaults() {
+    [[ -f "${CONFIG_FILE}" ]] || return 0
+    grep -q '^CAPTCHA_MAX_RETRIES=' "${CONFIG_FILE}" || echo 'CAPTCHA_MAX_RETRIES=6' >> "${CONFIG_FILE}"
+    grep -q '^CAPTCHA_RETRY_DELAY=' "${CONFIG_FILE}" || echo 'CAPTCHA_RETRY_DELAY=4' >> "${CONFIG_FILE}"
+    grep -q '^TZ=' "${CONFIG_FILE}" || echo 'TZ=Asia/Shanghai' >> "${CONFIG_FILE}"
+    chmod 600 "${CONFIG_FILE}"
 }
 
 install_python() {
@@ -578,18 +685,72 @@ EOF
     systemctl start ${SERVICE_NAME}.timer
 }
 
+uninstall_euserv_renew() {
+    echo ""
+    print_warning "即将完整卸载 EUserv 自动续期脚本"
+    echo "将删除："
+    echo "  - systemd 服务和定时器：${SERVICE_NAME}.service / ${SERVICE_NAME}.timer"
+    echo "  - 安装目录：${INSTALL_DIR}"
+    echo "  - 快捷命令：${COMMAND_LINK}"
+    echo ""
+    read -p "确认卸载？请输入 YES 继续: " confirm
+    [[ "$confirm" == "YES" ]] || { print_info "已取消卸载"; return; }
+
+    systemctl stop ${SERVICE_NAME}.timer 2>/dev/null || true
+    systemctl disable ${SERVICE_NAME}.timer 2>/dev/null || true
+    systemctl stop ${SERVICE_NAME}.service 2>/dev/null || true
+    rm -f /etc/systemd/system/${SERVICE_NAME}.service
+    rm -f /etc/systemd/system/${SERVICE_NAME}.timer
+    systemctl daemon-reload 2>/dev/null || true
+    systemctl reset-failed ${SERVICE_NAME}.service ${SERVICE_NAME}.timer 2>/dev/null || true
+    rm -rf "${INSTALL_DIR}"
+    rm -f "${COMMAND_LINK}"
+    print_success "EUserv 自动续期脚本已完整卸载"
+}
+
 # 创建快捷命令
 create_command() {
     cat > ${COMMAND_LINK} <<EOF
 #!/bin/bash
+INSTALL_DIR="${INSTALL_DIR}"
+SERVICE_NAME="${SERVICE_NAME}"
+COMMAND_LINK="${COMMAND_LINK}"
+
 echo "EUserv 管理面板 (离线完全体版)"
 echo "1. 立即执行"
 echo "2. 查看日志"
+echo "3. 查看定时器状态"
+echo "4. 完整卸载"
 echo "0. 退出"
 read -p "选择: " c
 case \$c in
-    1) systemctl start ${SERVICE_NAME}.service && journalctl -u ${SERVICE_NAME}.service -f ;;
-    2) journalctl -u ${SERVICE_NAME}.service -n 50 ;;
+    1) systemctl start \${SERVICE_NAME}.service && journalctl -u \${SERVICE_NAME}.service -f ;;
+    2) journalctl -u \${SERVICE_NAME}.service -n 80 --no-pager ;;
+    3) systemctl status \${SERVICE_NAME}.timer --no-pager ;;
+    4)
+        echo ""
+        echo "即将完整卸载 EUserv 自动续期脚本"
+        echo "将删除："
+        echo "  - systemd 服务和定时器：\${SERVICE_NAME}.service / \${SERVICE_NAME}.timer"
+        echo "  - 安装目录：\${INSTALL_DIR}"
+        echo "  - 快捷命令：\${COMMAND_LINK}"
+        echo ""
+        read -p "确认卸载？请输入 YES 继续: " confirm
+        if [[ "\$confirm" == "YES" ]]; then
+            systemctl stop \${SERVICE_NAME}.timer 2>/dev/null || true
+            systemctl disable \${SERVICE_NAME}.timer 2>/dev/null || true
+            systemctl stop \${SERVICE_NAME}.service 2>/dev/null || true
+            rm -f /etc/systemd/system/\${SERVICE_NAME}.service
+            rm -f /etc/systemd/system/\${SERVICE_NAME}.timer
+            systemctl daemon-reload 2>/dev/null || true
+            systemctl reset-failed \${SERVICE_NAME}.service \${SERVICE_NAME}.timer 2>/dev/null || true
+            rm -rf "\${INSTALL_DIR}"
+            rm -f "\${COMMAND_LINK}"
+            echo "卸载完成"
+        else
+            echo "已取消卸载"
+        fi
+        ;;
 esac
 EOF
     chmod +x ${COMMAND_LINK}
@@ -599,7 +760,7 @@ EOF
 main() {
     check_root
     create_directories
-    generate_local_files 
+    generate_local_files
     configure_env
     install_python
     setup_timer 3
