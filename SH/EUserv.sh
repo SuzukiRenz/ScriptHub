@@ -3,7 +3,7 @@
 # ===============================================================
 # EUserv 自动续期一键部署脚本 V2.0 - 离线集成版 (终极完全体)
 # ===============================================================
-
+# wget -O EUserv.sh https://raw.githubusercontent.com/SuzukiRenz/ScriptHub/refs/heads/main/SH/EUserv.sh && chmod +x EUserv.sh && ./EUserv.sh
 # 颜色定义
 RED='\033[0;31m'
 GREEN='\033[0;32m'
