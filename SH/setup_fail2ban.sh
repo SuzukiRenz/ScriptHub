@@ -6,6 +6,7 @@
 # =============================================================================
 
 # 不使用 set -e：交互脚本应尽量给出明确错误，并允许用户返回菜单继续处理。
+# wget -O vless-go.sh https://raw.githubusercontent.com/SuzukiRenz/ScriptHub/refs/heads/main/SH/setup_fail2ban.sh && chmod +x setup_fail2ban.sh && ./setup_fail2ban.sh
 
 # ─────────────────────────────────────────────
 # 颜色输出
