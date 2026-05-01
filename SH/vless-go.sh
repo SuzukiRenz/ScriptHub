@@ -33,6 +33,7 @@ CONF_DIR="/etc/vless-personal"
 CONF_FILE="${CONF_DIR}/config.env"
 TRAFFIC_FILE="${CONF_DIR}/traffic.env"
 LOG_FILE="/var/log/vless-personal.log"
+CADDY_ACCESS_LOG="/var/log/caddy/vless-personal-access.log"
 
 XRAY_BIN="/usr/local/bin/xray"
 XRAY_CONF_DIR="/etc/xray"
@@ -594,12 +595,16 @@ configure_caddy() {
 import ${CADDY_VLESS_CONF}
 EOF
 
-    # 站点配置 —— 与 v2.1 能工作的版本完全一致
-    # 注意：保留 tls{} 块和 ciphers（v2.1 就是这样能工作的）
-    # 注意：保留 X-Forwarded-For（只是 WARN 不是 ERROR，不影响功能）
-    # 注意：handle path 只用路径匹配，不检测 Upgrade header
+    # 站点配置
+    # 注意：只监听用户选择的 TLS 端口，不生成 :80 站点，也不做 HTTP→HTTPS 强制跳转。
+    # Caddy 仍可能为 ACME HTTP-01 临时使用 80 端口申请证书，但不会创建长期 80 端口跳转站点。
+    mkdir -p "$(dirname "$CADDY_ACCESS_LOG")"
+    if id caddy &>/dev/null; then
+        chown caddy:caddy "$(dirname "$CADDY_ACCESS_LOG")" 2>/dev/null || true
+    fi
     cat > "$CADDY_VLESS_CONF" << EOF
 ${domain}:${ext_port} {
+    auto_https disable_redirects
 
     tls {
         protocols tls1.2 tls1.3
@@ -626,7 +631,12 @@ ${domain}:${ext_port} {
     }
 
     log {
-        output discard
+        output file ${CADDY_ACCESS_LOG} {
+            roll_size 20MiB
+            roll_keep 5
+            roll_keep_for 720h
+        }
+        format json
     }
 }
 EOF
@@ -719,8 +729,8 @@ setup_services() {
                 journalctl -u caddy -n 20 --no-pager 2>/dev/null
                 echo ""
                 echo -e "  ${YELLOW}常见原因：${NC}"
-                echo "   • 80 端口被云服务商安全组封锁（需在控制台放行）"
                 echo "   • 域名 DNS A 记录未指向本机 IP"
+                echo "   • Caddy 申请证书失败（可查看菜单「5」中的 Caddy 诊断与日志）"
                 warn "Caddy 未运行。修复后执行菜单「4」重启。"
             else
                 info "Caddy 启动成功"
@@ -749,7 +759,7 @@ setup_services() {
                 echo -e "${RED}  ✗ Caddy 启动失败${NC}"
                 tail -30 /var/log/caddy.log 2>/dev/null \
                     || echo "  日志: /var/log/caddy.log 不存在，请检查 OpenRC 配置"
-                echo -e "  ${YELLOW}常见原因：80 端口被封 / DNS 未指向本机${NC}"
+                echo -e "  ${YELLOW}常见原因：DNS 未指向本机 / Caddy 证书申请失败 / 外部端口未放行${NC}"
             else
                 info "Caddy 启动成功"
             fi
@@ -920,7 +930,6 @@ setup_firewall() {
     load_conf
     step "配置防火墙"
     local PORTS=("${ext_port}")
-    [[ "${mode:-ws_tls}" == "ws_tls" ]] && PORTS+=(80)
 
     if command -v ufw &>/dev/null && ufw status 2>/dev/null | grep -q "active"; then
         for p in "${PORTS[@]}"; do ufw allow "${p}/tcp" >/dev/null 2>&1 || true; done
@@ -1232,9 +1241,10 @@ show_logs() {
     echo "  2) ${CORE_SVC} 错误上下文（journalctl -xe）"
     echo "  3) Caddy 系统日志（journalctl，含启动错误）"
     echo "  4) Caddy 配置诊断（validate + 端口/DNS 检查）"
-    echo "  5) 流量操作日志"
+    echo "  5) Caddy 访问日志（最近 100 行）"
+    echo "  6) 流量操作日志"
     echo "  0) 返回"
-    read -rp "  选择 [0-5]: " lc; echo ""
+    read -rp "  选择 [0-6]: " lc; echo ""
 
     case "$lc" in
         1)
@@ -1256,8 +1266,7 @@ show_logs() {
             fi
             ;;
         3)
-            # 注意：log{output discard} 只关闭"访问日志"文件
-            # 服务启动/错误日志始终写入 journalctl / stderr，这里是正确入口
+            # 服务启动/错误日志写入 journalctl / stderr；访问日志写入 CADDY_ACCESS_LOG。
             echo -e "${BOLD}  Caddy 服务日志（journalctl）:${NC}"
             if [[ "$INIT_SYS" == "systemd" ]]; then
                 # 显式使用 if，避免 &&/|| 在 journalctl 无输出时误触 warn
@@ -1287,7 +1296,7 @@ show_logs() {
 
             # [2] 端口监听
             echo -e "${CYAN}[2] 端口监听:${NC}"
-            for p in 80 "${ext_port:-8443}"; do
+            for p in "${ext_port:-8443}"; do
                 if ss -tlnp 2>/dev/null | grep -q ":${p}[^0-9]"; then
                     local proc; proc=$(ss -tlnp 2>/dev/null | awk -v p=":${p}" '$0~p{print $NF}' | head -1)
                     echo -e "  :${p}  ${GREEN}✓ 已监听${NC}  ($proc)"
@@ -1374,6 +1383,14 @@ show_logs() {
             hr
             ;;
         5)
+            if [[ -f "$CADDY_ACCESS_LOG" ]]; then
+                tail -100 "$CADDY_ACCESS_LOG"
+            else
+                warn "Caddy 访问日志不存在：$CADDY_ACCESS_LOG"
+                echo "  请确认已重新生成 Caddy 配置并重启 Caddy。"
+            fi
+            ;;
+        6)
             tail -50 "$LOG_FILE" 2>/dev/null || echo "暂无流量操作日志"
             ;;
     esac
@@ -1512,8 +1529,8 @@ EOF
     echo -e "  现在可以执行菜单「1」重新全新安装。"
     echo -e "  ${YELLOW}注意：${NC}重装前请确认："
     echo "    1. 域名 DNS A 记录已指向本机 IP"
-    echo "    2. 服务器 80 端口（云服务商安全组）已放行"
-    echo "    3. 本机防火墙（ufw/iptables）已允许 80 和目标端口"
+    echo "    2. 服务器目标端口（云服务商安全组）已放行"
+    echo "    3. 本机防火墙（ufw/iptables）已允许目标端口"
     echo ""
 }
 
@@ -1857,7 +1874,7 @@ EOF
     echo ""
     if [[ "$MODE" == "ws_tls" ]]; then
         echo -e "  ${YELLOW}⚠ 重要：${NC}请确保 ${CYAN}${DOMAIN}${NC} 的 DNS A 记录已指向本机 IP"
-        echo -e "  Caddy 通过 HTTP-01（端口 80）申请 Let's Encrypt 证书，约需 30~60 秒"
+        echo -e "  Caddy 将在 ${EXT_PORT_IN} 提供 HTTPS 服务；脚本已禁用 HTTP→HTTPS 自动跳转"
     else
         echo -e "  ${YELLOW}⚠ 注意：${NC}Reality 模式直接监听 :${EXT_PORT_IN}，无需域名，即可连接"
     fi
