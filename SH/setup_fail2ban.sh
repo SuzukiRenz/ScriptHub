@@ -6,7 +6,6 @@
 # =============================================================================
 
 # 不使用 set -e：交互脚本应尽量给出明确错误，并允许用户返回菜单继续处理。
-# wget -O setup_fail2ban.sh https://raw.githubusercontent.com/SuzukiRenz/ScriptHub/refs/heads/main/SH/setup_fail2ban.sh && chmod +x setup_fail2ban.sh && ./setup_fail2ban.sh
 
 # ─────────────────────────────────────────────
 # 颜色输出
@@ -73,14 +72,16 @@ is_port() {
 
 read_number_default() {
     # $1=提示 $2=默认值
+    # 结果写入 NUMBER_RESULT；不要用命令替换接收，否则交互提示会被吞掉。
     _prompt="$1"
     _default="$2"
+    NUMBER_RESULT=""
     while :; do
         ask "$_prompt（默认 $_default）:"
         read -r _value
         _value="${_value:-$_default}"
         if is_number "$_value"; then
-            printf "%s" "$_value"
+            NUMBER_RESULT="$_value"
             return 0
         fi
         warn "请输入数字"
@@ -734,11 +735,14 @@ firewall_port_menu() {
 # ─────────────────────────────────────────────
 config_base_params() {
     step "配置基础参数"
-    BAN_TIME=$(read_number_default "封禁时长 bantime，秒；3600=1小时，86400=1天" "$BAN_TIME")
+    read_number_default "封禁时长 bantime，秒；3600=1小时，86400=1天" "$BAN_TIME"
+    BAN_TIME="$NUMBER_RESULT"
     printf "\n"
-    FIND_TIME=$(read_number_default "检测时间窗口 findtime，秒；600=10分钟" "$FIND_TIME")
+    read_number_default "检测时间窗口 findtime，秒；600=10分钟" "$FIND_TIME"
+    FIND_TIME="$NUMBER_RESULT"
     printf "\n"
-    MAX_RETRY=$(read_number_default "最大失败次数 maxretry；建议 3-5" "$MAX_RETRY")
+    read_number_default "最大失败次数 maxretry；建议 3-5" "$MAX_RETRY"
+    MAX_RETRY="$NUMBER_RESULT"
     printf "\n"
 
     ask "白名单 IP / 网段（空格分隔，默认当前值：$IGNOREIP）:"
