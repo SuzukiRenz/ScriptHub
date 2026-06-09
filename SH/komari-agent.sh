@@ -4,8 +4,8 @@
 # Behavior:
 #   - If agent arguments are provided, install and enable monitoring directly (compatible with original install.sh).
 #   - If no agent arguments are provided, show a guided menu for install/uninstall/status and SSH quick menu setup.
-#   wget -O /usr/local/bin/komari-install.sh 你的增强版脚本地址 && chmod +x /usr/local/bin/komari-agent.sh
-
+#   wget -O /usr/local/bin/komari-agent.sh https://raw.githubusercontent.com/SuzukiRenz/ScriptHub/refs/heads/main/SH/komari-agent.sh && chmod +x /usr/local/bin/komari-agent.sh && komari-agent.sh --install-menu-shortcut
+#   SSH 里输入 komari-agent-menu 就能唤出菜单
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
