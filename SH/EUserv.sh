@@ -1,7 +1,10 @@
 #!/bin/bash
 
 # ===============================================================
-# EUserv 自动续期一键部署脚本 V2.0 - 离线集成版 (终极完全体)
+# EUserv 自动续期一键部署脚本 V2.1 - 离线集成版 (终极完全体)
+# 新增：基于本地状态文件的智能跳过逻辑。续期成功后会记录 EUserv 返回的
+# 真实"可续期日期"，在该日期之前的每日定时任务会直接跳过（不登录、不触发
+# 验证码/邮箱PIN、不发送TG通知），避免每天空跑消耗接码/验证码额度。
 # ===============================================================
 # wget -O EUserv.sh https://raw.githubusercontent.com/SuzukiRenz/ScriptHub/refs/heads/main/SH/EUserv.sh && chmod +x EUserv.sh && ./EUserv.sh
 # 颜色定义
@@ -89,6 +92,11 @@ if not hasattr(Image, 'ANTIALIAS'):
 
 
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/94.0.4606.61 Safari/537.36"
+
+# 本地状态文件：记录每个账号/订单最近一次查询到的"可续期日期"。
+# 只要该日期还没到，就跳过整次执行（不登录、不触发验证码/邮箱PIN），
+# 从而避免在续期窗口未到时的无意义每日执行。
+STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "renew_state.json")
 
 class AccountConfig:
     def __init__(self, email, password, imap_server='imap.gmail.com', email_password=''):
@@ -493,6 +501,46 @@ def send_telegram(message: str, config: GlobalConfig):
         requests.post(url, json=data, timeout=10)
     except Exception as e: logger.error(f"TG通知异常: {e}")
 
+def load_state() -> dict:
+    """读取本地状态文件（记录每个账号各订单最近一次查到的可续期日期）。"""
+    try:
+        with open(STATE_FILE, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+def save_state(state: dict):
+    try:
+        with open(STATE_FILE, 'w', encoding='utf-8') as f:
+            json.dump(state, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logger.error(f"保存状态文件失败: {e}")
+
+def should_skip_account(email: str, state: dict) -> Optional[str]:
+    """
+    判断该账号本次是否可以整体跳过（不登录、不触发验证码/邮箱PIN）。
+    只有当该账号名下*所有*订单上次查到的"可续期日期"都还在未来时，才跳过；
+    只要有一个订单已到期、或缺少历史记录，都必须照常执行一次去确认真实状态。
+    返回值：None 表示需要执行；否则返回跳过原因（各订单的最早可续期日期说明）。
+    """
+    acc_state = state.get(email)
+    if not acc_state or not acc_state.get('servers'):
+        return None  # 没有历史记录，必须执行一次
+    today = datetime.today().date()
+    reasons = []
+    for oid, info in acc_state['servers'].items():
+        date_str = info.get('can_renew_date') if isinstance(info, dict) else None
+        if not date_str:
+            return None  # 缺少日期信息，保守起见照常执行
+        try:
+            d = datetime.strptime(date_str, "%Y-%m-%d").date()
+        except ValueError:
+            return None
+        if d <= today:
+            return None  # 至少有一个订单已到可续期日期，必须执行
+        reasons.append(f"订单{oid}最早{date_str}可续期(剩{(d - today).days}天)")
+    return "；".join(reasons) if reasons else None
+
 def process_account(account_config: AccountConfig, global_config: GlobalConfig) -> Dict:
     result = {'email': account_config.email, 'success': False, 'servers': {}, 'renew_results': [], 'error': None}
     try:
@@ -516,12 +564,23 @@ def process_account(account_config: AccountConfig, global_config: GlobalConfig) 
             result['success'] = True
             return result
         
+        any_renewed = False
         for order_id, (can_renew, can_renew_date) in servers.items():
             if can_renew:
                 if euserv.renew_server(order_id):
                     result['renew_results'].append({'order_id': order_id, 'message': f"✅ 续期成功"})
+                    any_renewed = True
                 else:
                     result['renew_results'].append({'order_id': order_id, 'message': f"❌ 续期失败"})
+
+        if any_renewed:
+            # 续期后重新拉取一次服务器列表，获取续期后新的"可续期日期"，
+            # 用于更新本地状态文件，让后续运行可以据此正确跳过。
+            time.sleep(3)
+            refreshed = euserv.get_servers()
+            if refreshed:
+                result['servers'] = refreshed
+
         result['success'] = True
     except Exception as e:
         result['error'] = str(e)
@@ -529,14 +588,46 @@ def process_account(account_config: AccountConfig, global_config: GlobalConfig) 
 
 def main():
     if not ACCOUNTS: return
+
+    # FORCE_RUN=1 时强制执行，忽略跳过逻辑（用于手动触发的"立即执行"）。
+    force_run = os.getenv("FORCE_RUN", "").strip() == "1"
+    state = load_state()
+
+    accounts_to_run: List[AccountConfig] = []
+    skipped: List[Tuple[str, str]] = []
+    for account in ACCOUNTS:
+        skip_reason = None if force_run else should_skip_account(account.email, state)
+        if skip_reason:
+            logger.info(f"⏭️ 跳过账号 {account.email}，尚未到可续期日期: {skip_reason}")
+            skipped.append((account.email, skip_reason))
+        else:
+            accounts_to_run.append(account)
+
+    if not accounts_to_run:
+        # 所有账号都还没到续期窗口：不登录、不触发验证码/邮箱PIN、不发送TG通知，
+        # 直接结束本次运行，避免每天空跑消耗资源。
+        logger.info(f"本次运行 {len(skipped)} 个账号均未到续期窗口，跳过登录，直接结束。")
+        return
+
     all_results = []
     with ThreadPoolExecutor(max_workers=GLOBAL_CONFIG.max_workers) as executor:
-        future_to_account = {executor.submit(process_account, account, GLOBAL_CONFIG): account for account in ACCOUNTS}
+        future_to_account = {executor.submit(process_account, account, GLOBAL_CONFIG): account for account in accounts_to_run}
         for future in as_completed(future_to_account):
             try: all_results.append(future.result())
             except Exception as e: all_results.append({'email': future_to_account[future].email, 'success': False, 'error': str(e)})
-    
+
+    # 更新本地状态：记录每个订单最新的"可续期日期"，供下次运行判断是否可以跳过。
+    for result in all_results:
+        if result['success'] and result.get('servers'):
+            state[result['email']] = {
+                'servers': {oid: {'can_renew_date': date} for oid, (_, date) in result['servers'].items() if date},
+                'last_check': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            }
+    save_state(state)
+
     msg_parts = [f"<b>🔄 EUserv 续期报告</b>\n时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"]
+    for email, reason in skipped:
+        msg_parts.append(f"\n<b>⏭️ {email}</b>\n  未到续期窗口，已跳过: {reason}")
     for result in all_results:
         msg_parts.append(f"\n<b>📧 {result['email']}</b>")
         if not result['success']:
@@ -549,7 +640,7 @@ def main():
             msg_parts.append("  ✓ 无需续期")
             for oid, (_, date) in result.get('servers', {}).items():
                 if date: msg_parts.append(f"    订单 {oid}: {date}")
-    
+
     send_telegram("\n".join(msg_parts), GLOBAL_CONFIG)
 
 if __name__ == "__main__":
@@ -717,17 +808,32 @@ SERVICE_NAME="${SERVICE_NAME}"
 COMMAND_LINK="${COMMAND_LINK}"
 
 echo "EUserv 管理面板 (离线完全体版)"
-echo "1. 立即执行"
-echo "2. 查看日志"
-echo "3. 查看定时器状态"
-echo "4. 完整卸载"
+echo "1. 立即执行（遵循跳过逻辑，未到续期窗口则秒退，同定时任务）"
+echo "2. 强制立即执行（忽略跳过逻辑，一定会登录检查）"
+echo "3. 查看日志"
+echo "4. 查看续期状态（各订单下次可续期日期）"
+echo "5. 查看定时器状态"
+echo "6. 完整卸载"
 echo "0. 退出"
 read -p "选择: " c
 case \$c in
     1) systemctl start \${SERVICE_NAME}.service && journalctl -u \${SERVICE_NAME}.service -f ;;
-    2) journalctl -u \${SERVICE_NAME}.service -n 80 --no-pager ;;
-    3) systemctl status \${SERVICE_NAME}.timer --no-pager ;;
+    2)
+        set -a
+        source "\${INSTALL_DIR}/config.env"
+        set +a
+        FORCE_RUN=1 "\${INSTALL_DIR}/venv/bin/python3" "\${INSTALL_DIR}/euser_renew.py"
+        ;;
+    3) journalctl -u \${SERVICE_NAME}.service -n 80 --no-pager ;;
     4)
+        if [[ -f "\${INSTALL_DIR}/renew_state.json" ]]; then
+            "\${INSTALL_DIR}/venv/bin/python3" -m json.tool "\${INSTALL_DIR}/renew_state.json"
+        else
+            echo "暂无状态记录（尚未成功执行过一次）"
+        fi
+        ;;
+    5) systemctl status \${SERVICE_NAME}.timer --no-pager ;;
+    6)
         echo ""
         echo "即将完整卸载 EUserv 自动续期脚本"
         echo "将删除："
