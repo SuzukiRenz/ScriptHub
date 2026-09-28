@@ -253,24 +253,49 @@ install_xray() {
 #  包格式:   sing-box-{ver}-linux-{arch}.tar.gz
 # ═══════════════════════════════════════════════════════════════════
 
+# 安装或更新 sing-box。可通过 SBOX_VERSION=vX.Y.Z 固定版本。
 install_singbox() {
     step "安装 sing-box"
-    local ARCH TMP VER VER_NUM PKG URL LDD
-    ARCH=$(sbox_arch); TMP=$(mktemp -d)
-    info "查询最新稳定版本（过滤 alpha/beta/rc）..."
-    VER=$(curl -s --max-time 10 "https://api.github.com/repos/SagerNet/sing-box/releases" \
-          | grep '"tag_name"' | grep -v 'alpha\|beta\|rc' | head -1 | cut -d'"' -f4)
-    [[ -z "$VER" ]] && VER="v1.11.4"
+    local ARCH TMP VER VER_NUM PKG URL LDD API
+    ARCH=$(sbox_arch)
+    TMP=$(mktemp -d)
+    trap 'rm -rf "$TMP"' RETURN
+
+    if [[ -n "${SBOX_VERSION:-}" ]]; then
+        VER="${SBOX_VERSION#v}"
+        VER="v${VER}"
+    else
+        API=$(curl -fsSL --max-time 15 \
+            "https://api.github.com/repos/SagerNet/sing-box/releases?per_page=30" \
+            2>/dev/null) || API=""
+        # 只接受正式版，避免把 alpha、beta、rc 当作稳定版。
+        VER=$(printf '%s\n' "$API" \
+            | grep '"tag_name"' \
+            | grep -vE 'alpha|beta|rc' \
+            | head -1 \
+            | sed -E 's/.*"tag_name"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/')
+        [[ -z "$VER" ]] && VER="v1.11.4"
+    fi
+
+    [[ "$VER" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] \
+        || error "sing-box 版本格式无效: ${VER}"
     VER_NUM="${VER#v}"
     PKG="sing-box-${VER_NUM}-linux-${ARCH}"
     URL="https://github.com/SagerNet/sing-box/releases/download/${VER}/${PKG}.tar.gz"
     info "版本: ${VER}  arch: ${ARCH}"
-    info "下载: ${URL}"
-    wget -qO "${TMP}/sing-box.tar.gz" "$URL" || error "sing-box 下载失败，请检查网络"
-    tar -xzf "${TMP}/sing-box.tar.gz" -C "${TMP}/"
+    info "下载 sing-box..."
+
+    wget -q --show-progress -t 3 -O "${TMP}/sing-box.tar.gz" "$URL" \
+        || error "sing-box 下载失败，请检查网络或版本是否存在"
+    tar -tzf "${TMP}/sing-box.tar.gz" >/dev/null \
+        || error "sing-box 压缩包校验失败"
+    tar -xzf "${TMP}/sing-box.tar.gz" -C "$TMP/" \
+        || error "sing-box 压缩包解压失败"
+    [[ -x "${TMP}/${PKG}/sing-box" ]] \
+        || error "压缩包内未找到 sing-box 可执行文件"
     install -m 755 "${TMP}/${PKG}/sing-box" "$SBOX_BIN"
 
-    # Alpine glibc 兼容处理（避免 'cannot execute: required file not found'）
+    # Alpine 运行预编译二进制需要 glibc 兼容层时自动补齐。
     if [[ "$PKG_MGR" == "apk" ]]; then
         LDD=$(ldd "$SBOX_BIN" 2>&1 || true)
         if echo "$LDD" | grep -qi "ld-linux"; then
@@ -278,7 +303,6 @@ install_singbox() {
         fi
     fi
 
-    rm -rf "$TMP"
     info "sing-box 安装完成: $("$SBOX_BIN" version 2>&1 | head -1)"
 }
 
