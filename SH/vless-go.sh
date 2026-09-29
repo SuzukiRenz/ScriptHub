@@ -138,7 +138,13 @@ ws_path_from_domain() { echo "/${1%%.*}"; }
 
 is_installed() { [[ -f "$CONF_FILE" ]] && grep -q "^uuid=" "$CONF_FILE"; }
 
-load_conf()    { [[ -f "$CONF_FILE" ]]   || return 1; source "$CONF_FILE"; }
+load_conf() {
+    [[ -f "$CONF_FILE" ]] || return 1
+    source "$CONF_FILE"
+    SERVER_IP="${server_ip:-${SERVER_IP:-}}"
+    NETWORK_MODE="${network_mode:-${NETWORK_MODE:-unknown}}"
+    LISTEN_ADDR="${listen_addr:-${LISTEN_ADDR:-0.0.0.0}}"
+}
 load_traffic() { [[ -f "$TRAFFIC_FILE" ]] || return 1; source "$TRAFFIC_FILE"; }
 
 service_cmd()    { [[ "$INIT_SYS" == "systemd" ]] && systemctl "$1" "$2" 2>/dev/null || rc-service "$2" "$1" 2>/dev/null; }
@@ -148,11 +154,46 @@ service_is_active() {
                                    || rc-service "$1" status 2>/dev/null | grep -q started
 }
 
+# 动态检测网络栈：v4、v6 或双栈。
+# 双栈/仅 IPv6 使用 ::，仅 IPv4 使用 0.0.0.0。
+detect_network() {
+    local v4_ip v6_ip
+    v4_ip=$(curl -4 -fsS --max-time 5 https://api.ipify.org 2>/dev/null || true)
+    v6_ip=$(curl -6 -fsS --max-time 5 https://api6.ipify.org 2>/dev/null || true)
+
+    if [[ -n "$v4_ip" && -n "$v6_ip" ]]; then
+        NETWORK_MODE="dual"
+        SERVER_IP="$v4_ip"
+        LISTEN_ADDR="::"
+    elif [[ -n "$v6_ip" ]]; then
+        NETWORK_MODE="ipv6"
+        SERVER_IP="$v6_ip"
+        LISTEN_ADDR="::"
+    elif [[ -n "$v4_ip" ]]; then
+        NETWORK_MODE="ipv4"
+        SERVER_IP="$v4_ip"
+        LISTEN_ADDR="0.0.0.0"
+    else
+        NETWORK_MODE="unknown"
+        SERVER_IP=""
+        LISTEN_ADDR="0.0.0.0"
+    fi
+
+    info "网络环境: ${NETWORK_MODE}，监听地址: ${LISTEN_ADDR}"
+}
+
 get_server_ip() {
-    curl -s4 --max-time 5 https://api.ipify.org 2>/dev/null ||
-    curl -s4 --max-time 5 https://ifconfig.me   2>/dev/null ||
+    [[ -n "${SERVER_IP:-}" ]] && { printf '%s\n' "$SERVER_IP"; return; }
+    detect_network >/dev/null
+    [[ -n "${SERVER_IP:-}" ]] && printf '%s\n' "$SERVER_IP" ||
     ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") print $(i+1); exit}' ||
+    ip -6 route get 2606:4700:4700::1111 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") print $(i+1); exit}' ||
     hostname -I 2>/dev/null | awk '{print $1}'
+}
+
+format_host_for_url() {
+    local host="$1"
+    [[ "$host" == *:* && "$host" != \[*\] ]] && printf '[%s]\n' "$host" || printf '%s\n' "$host"
 }
 
 # 根据 config.env 中 core_type 返回服务名 / 二进制路径 / 配置文件路径
@@ -453,7 +494,7 @@ EOF
 {
   "log": { "loglevel": "warning", "access": "none" },
   "inbounds": [{
-    "listen": "0.0.0.0",
+    "listen": "${LISTEN_ADDR:-0.0.0.0}",
     "port": ${ext_port},
     "protocol": "vless",
     "settings": {
@@ -555,7 +596,7 @@ EOF
   "inbounds": [{
     "type": "vless",
     "tag": "vless-in",
-    "listen": "0.0.0.0",
+    "listen": "${LISTEN_ADDR:-0.0.0.0}",
     "listen_port": ${ext_port},
     "users": [{ "uuid": "${uuid}", "flow": "xtls-rprx-vision" }],
     "tls": {
@@ -968,8 +1009,17 @@ setup_firewall() {
         [[ "$OS_ID" == "alpine" ]] \
             && iptables-save > /etc/iptables/rules-save 2>/dev/null || true
         info "iptables: 已放行端口 ${PORTS[*]}"
-    else
-        warn "请手动放行端口: ${PORTS[*]}"
+    fi
+    # IPv6 主机/双栈主机还必须同步放行 ip6tables。
+    if command -v ip6tables &>/dev/null; then
+        for p in "${PORTS[@]}"; do
+            ip6tables -C INPUT -p tcp --dport "$p" -j ACCEPT 2>/dev/null || \
+                ip6tables -I INPUT -p tcp --dport "$p" -j ACCEPT
+        done
+        info "ip6tables: 已放行端口 ${PORTS[*]}"
+    fi
+    if ! command -v iptables &>/dev/null && ! command -v ip6tables &>/dev/null; then
+        warn "iptables/ip6tables 均不可用，请手动放行端口: ${PORTS[*]}"
     fi
 }
 
@@ -1049,7 +1099,7 @@ show_config() {
                        || printf '%s' "${ws_path}" | sed 's|/|%2F|g')
         LINK="vless://${uuid}@${domain}:${ext_port}?encryption=none&security=tls&sni=${domain}&type=ws&host=${domain}&path=${encoded_path}#VLESS-${domain}"
     else
-        LINK="vless://${uuid}@${server_ip}:${ext_port}?encryption=none&security=reality&sni=${reality_dest}&pbk=${reality_public_key}&sid=${reality_short_id}&fp=chrome&flow=xtls-rprx-vision&type=tcp#VLESS-Reality"
+        LINK="vless://${uuid}@$(format_host_for_url "$server_ip"):${ext_port}?encryption=none&security=reality&sni=${reality_dest}&pbk=${reality_public_key}&sid=${reality_short_id}&fp=chrome&flow=xtls-rprx-vision&type=tcp#VLESS-Reality"
     fi
 
     echo -e "  ${GREEN}${LINK}${NC}"; echo ""
@@ -1834,12 +1884,16 @@ do_install() {
         info "Short ID: ${R_SHORT_ID}"
     fi
 
-    # ── 写入 config.env ──────────────────────────────────────────
-    # ⚠ install_date 必须加双引号：否则 source 时时间中的空格导致
-    #   bash 将 "HH:MM:SS" 当命令执行，报 command not found
+    detect_network
+    [[ -n "${SERVER_IP:-}" ]] || error "无法检测公网 IP，请检查 IPv4/IPv6 网络连通性"
+
+    # 写入配置时保存检测结果，后续菜单操作不依赖安装时的临时变量。
     mkdir -p "$CONF_DIR"
     cat > "$CONF_FILE" << EOF
 # VLESS Personal Edition 配置文件（请勿手动修改）
+network_mode=${NETWORK_MODE}
+server_ip=${SERVER_IP}
+listen_addr=${LISTEN_ADDR}
 core_type=${CORE_TYPE}
 mode=${MODE}
 uuid=${AUTO_UUID}
@@ -1869,6 +1923,10 @@ reality_public_key=${R_PUB_KEY}
 reality_short_id=${R_SHORT_ID}
 EOF
     fi
+
+    # 先检测网络栈，再生成核心配置，确保仅 IPv6 主机使用 :: 监听。
+    detect_network
+    [[ -n "${SERVER_IP:-}" ]] || error "无法检测公网 IP，请检查 IPv4/IPv6 网络连通性"
 
     # ── 配置各组件 ─────────────────────────────────────────────
     # configure_core 从 CONF_FILE 读取参数，根据 core_type + mode 生成正确的 JSON
