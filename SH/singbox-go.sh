@@ -546,6 +546,11 @@ node_new() {
     cfg_load
     local core="${core_type:-singbox}"
 
+    # 生成 Reality 密钥要调用核心二进制；缺失时这里先补齐，
+    # 否则走到后面 gen_reality_keys 才失败，体验更差。
+    ensure_runtime_deps
+    ensure_core_binary "$core"
+
     echo ""
     echo -e "${BOLD}  新建节点${NC}"
     hr
@@ -968,6 +973,7 @@ sb_generate() {
         fi
     fi
 
+    # 没有任何节点时也要产出合法配置（空 inbounds 是合法的）
     jq -n --argjson inb "$inbounds" --argjson ep "$endpoints" \
           --argjson outs "$outs" --argjson rules "$rules" '
       ({
@@ -987,7 +993,8 @@ xray_node_json() {
     node_load "$id" || return 1
     [[ "${N_ENABLED}" == "true" ]] || return 1
     local tag="in-${N_ID}"
-    local listen="0.0.0.0" port="${N_PORT:-0}" net="tcp" sec="none"
+    local listen; listen=$(public_listen_addr)
+    local port="${N_PORT:-0}" net="tcp" sec="none"
     [[ "$N_MODE" == ws ]] && { listen="127.0.0.1"; port="${N_LOCAL_PORT:-0}"; net="ws"; }
     # 端口必须是非 0 整数，否则 jq --argjson 会因空串/非法值整份生成失败
     [[ "$port" =~ ^[0-9]+$ ]] && (( port > 0 )) || { errln "节点 ${N_ID} 端口非法: '${port}'"; return 1; }
@@ -1162,6 +1169,11 @@ apply_all() {
     cfg_load
     local core="${core_type:-singbox}"
     local tmp_sb tmp_xr had_ws=0
+
+    # 核心二进制缺失时先补齐：老版本只装了依赖没装核心，
+    # 或者被人为删掉，都会让后续 check 变成 "No such file or directory"。
+    ensure_runtime_deps
+    ensure_core_binary "$core"
 
     step "生成并校验配置"
     mkdir -p "$SBOX_CONF_DIR" "$XRAY_CONF_DIR" "$FAKE_WEBROOT"
@@ -1517,10 +1529,55 @@ human_bytes() {
 #  12. 客户端链接
 # ═══════════════════════════════════════════════════════════════════════════
 
+# 确认代理核心二进制在位，缺了就装。apply_all / 建节点前都会调用。
+ensure_core_binary() {
+    local core="${1:-singbox}"
+    if [[ "$core" == singbox ]]; then
+        [[ -x "$SBOX_BIN" ]] && return 0
+        warn "未检测到 sing-box 核心，正在安装..."
+        install_singbox
+        [[ -x "$SBOX_BIN" ]] || die "sing-box 安装失败，请手动执行: bash $0 后重新运行"
+    else
+        [[ -x "$XRAY_BIN" ]] && return 0
+        warn "未检测到 Xray 核心，正在安装..."
+        install_xray
+        [[ -x "$XRAY_BIN" ]] || die "Xray 安装失败"
+    fi
+    info "核心就绪: $("${SBOX_BIN:-$XRAY_BIN}" version 2>&1 | head -1)"
+    return 0
+}
+
+# 机器有公网 IPv6 时用 "::" 双栈监听（Linux 下同时收 v4/v6），
+# 否则退回 "0.0.0.0"。缓存到 config.env 的 listen_addr，避免每次探测。
+public_listen_addr() {
+    local la; la=$(cfg_get listen_addr)
+    if [[ -n "$la" ]]; then printf '%s' "$la"; return; fi
+    local ip; ip=$(cfg_get server_ip)
+    if [[ "$ip" == *:* ]] || ip -6 addr show scope global 2>/dev/null | grep -q inet6; then
+        printf '%s' "::"
+    else
+        printf '%s' "0.0.0.0"
+    fi
+}
+
+# URL 里的 IPv6 必须加方括号，否则 @2001:db8::1:2096 会被当成非法 host:port。
+# 已经带括号的原样返回；域名/IPv4 不加。
+url_host() {
+    local h="$1"
+    case "$h" in
+        \[*\]) printf '%s' "$h" ;;                 # 已带括号
+        *:*)     printf '[%s]' "$h" ;;              # IPv6 裸地址
+        *)       printf '%s' "$h" ;;
+    esac
+}
+
 node_host() {
     cfg_load
-    if [[ "$N_MODE" == ws ]]; then printf '%s' "${N_DOMAIN:-${N_SNI}}"
-    else printf '%s' "$(cfg_get server_ip)"; fi
+    if [[ "$N_MODE" == ws ]]; then
+        printf '%s' "${N_DOMAIN:-${N_SNI}}"
+    else
+        url_host "$(cfg_get server_ip)"
+    fi
 }
 
 _urlesc() { jq -rn --arg s "$1" '$s|@uri'; }
