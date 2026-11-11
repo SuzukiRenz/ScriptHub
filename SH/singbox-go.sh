@@ -677,18 +677,39 @@ gen_wg_priv() { openssl rand -base64 32 | tr -d '\n'; }
 
 # 由私钥派生公钥：把 raw 私钥包成 PKCS#8 DER，交给 openssl 求公钥，
 # 再从 SubjectPublicKeyInfo DER 的末尾取 32 字节 raw 公钥。
+# 由私钥派生公钥：把 raw 私钥包成 PKCS#8 DER，交给 openssl 求公钥，
+# 再从 SubjectPublicKeyInfo DER 的末尾取 32 字节 raw 公钥。
+# 用 od 做二进制处理，不依赖 xxd（部分精简系统没有 xxd）。
+# hex -> 二进制。二进制含 NUL，绝不能存进 bash 变量，
+# 只用于管道：printf_hex2bin <hex> | cmd
+printf_hex2bin() {
+    local h="$1" i out=""
+    for (( i=0; i<${#h}; i+=2 )); do
+        out+="\\x${h:i:2}"
+    done
+    printf "%b" "$out"
+}
+_bin2hex() { od -An -v -tx1 | tr -d ' \n'; }
+
+# 由私钥派生公钥：
+#   raw 私钥(base64) -> hex -> 拼 PKCS#8 -> openssl 求 SPKI -> 取尾 32 字节 -> base64
+# 全程管道，不把二进制放进变量（会因 NUL 被截断）。
 wg_pub() {
-    local priv="$1" der pubder
+    local priv="$1" priv_hex der_hex spki_hex pub_hex
     [[ -n "$priv" ]] || return 1
-    der=$(printf '%s' "${_WG_PKCS8_HEAD}$(printf '%s' "$priv" | base64 -d 2>/dev/null | od -An -tx1 -v | tr -d ' \n')" \
-          | xxd -r -p 2>/dev/null | base64 -w0 2>/dev/null)
-    [[ -n "$der" ]] || return 1
-    pubder=$(printf '%s' "$der" | base64 -d 2>/dev/null \
-             | openssl pkey -inform DER -pubout -outform DER 2>/dev/null \
-             | od -An -tx1 -v | tr -d ' \n')
-    [[ ${#pubder} -ge 64 ]] || return 1
-    # SubjectPublicKeyInfo 固定 12 字节头 + 32 字节公钥
-    printf '%s' "${pubder: -64}" | xxd -r -p 2>/dev/null | base64 -w0 2>/dev/null
+
+    priv_hex=$(printf '%s' "$priv" | base64 -d 2>/dev/null | _bin2hex)
+    [[ ${#priv_hex} -eq 64 ]] || return 1
+
+    der_hex="${_WG_PKCS8_HEAD}${priv_hex}"
+
+    spki_hex=$(printf_hex2bin "$der_hex" \
+               | openssl pkey -inform DER -pubout -outform DER 2>/dev/null \
+               | _bin2hex)
+    [[ ${#spki_hex} -eq 88 ]] || return 1
+
+    pub_hex="${spki_hex: -64}"
+    printf_hex2bin "$pub_hex" | base64 -w0 2>/dev/null
 }
 
 # 生成一对 WireGuard 密钥，回显 "私钥 公钥"
@@ -1576,7 +1597,7 @@ node_list() {
 }
 
 node_toggle() {
-    local id; id=$(ask "节点 ID")
+    local id="${1:-}"; [[ -n "$id" ]] || id=$(ask "节点 ID")
     node_load "$id" || die "节点 $id 不存在"
     if [[ "$N_ENABLED" == true ]]; then N_ENABLED=false; else N_ENABLED=true; fi
     node_save
@@ -1585,11 +1606,29 @@ node_toggle() {
     apply_all
 }
 
+# node_set_enabled <id> <true|false> —— 幂等设置节点启用状态
+node_set_enabled() {
+    local id="$1" want="$2"
+    node_load "$id" || die "节点 $id 不存在"
+    N_ENABLED="$want"
+    node_save
+    [[ "$want" == true ]] && info "节点 ${id} 已启用" || info "节点 ${id} 已停用"
+    apply_all
+}
+
 node_remove() {
-    local id; id=$(ask "节点 ID")
+    local id="${1:-}"; [[ -n "$id" ]] || id=$(ask "节点 ID")
     node_load "$id" || die "节点 $id 不存在"
     kv "备注" "$N_REMARK"; kv "协议" "$(proto_rank_name "$N_PROTO")"
     confirm "确认删除节点 ${id}?" n || { info "已取消"; return; }
+    node_delete "$id"
+    apply_all
+}
+
+# node_remove_force <id> —— 命令行删除，不二次确认
+node_remove_force() {
+    local id="$1"
+    node_load "$id" || die "节点 $id 不存在"
     node_delete "$id"
     apply_all
 }
@@ -1853,7 +1892,8 @@ do_uninstall() {
     sed -i '/singbox-go/d' /etc/crontabs/root 2>/dev/null || true
     local id
     for id in $(node_ids); do
-        node_load "$id"; iptables -D INPUT -p tcp --dport "$N_PORT" -j "$(_chain_name "$N_PORT")" 2>/dev/null || true
+        node_load "$id"
+        iptables -D INPUT -p tcp --dport "$N_PORT" -j "$(_chain_name "$N_PORT")" 2>/dev/null || true
         iptables -F "$(_chain_name "$N_PORT")" 2>/dev/null; iptables -X "$(_chain_name "$N_PORT")" 2>/dev/null
         iptables -F "$(_output_chain_name "$N_PORT")" 2>/dev/null; iptables -X "$(_output_chain_name "$N_PORT")" 2>/dev/null
     done
@@ -1968,11 +2008,9 @@ main() {
         show)      node_show "${2:?需要节点 ID}" ;;
         link)      node_link "${2:?需要节点 ID}"; echo ;;
         add)       node_new ;;
-        del)       node_remove ;;
-        on)        node_load "${2:?需要节点 ID}" || die "节点不存在"
-                   N_ENABLED=true; node_save; apply_all ;;
-        off)       node_load "${2:?需要节点 ID}" || die "节点不存在"
-                   N_ENABLED=false; node_save; apply_all ;;
+        del)       node_remove_force "${2:?需要节点 ID}" ;;
+        on)        node_set_enabled "${2:?需要节点 ID}" true ;;
+        off)       node_set_enabled "${2:?需要节点 ID}" false ;;
         apply)     apply_all ;;
         status)    service_menu </dev/null ;;
         traffic)   show_traffic ;;
