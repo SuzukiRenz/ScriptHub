@@ -142,6 +142,38 @@ pkg_install() {
     fi
 }
 
+# 运行期依赖自检：任何子命令都先确认 jq/openssl/curl 在位，
+# 缺了就自动补装一次（避免"装完脚本没装依赖 → 用到一半才报 jq not found"）。
+ensure_runtime_deps() {
+    local missing=() b
+    for b in jq openssl curl; do
+        command -v "$b" >/dev/null 2>&1 || missing+=("$b")
+    done
+    (( ${#missing[@]} )) || return 0
+
+    warn "缺少依赖: ${missing[*]}，正在自动安装..."
+    [[ -n "${PKG_MGR:-}" ]] || detect_os
+
+    # jq 的二进制名与包名一致；openssl/curl 也一样。
+    case "$PKG_MGR" in
+        apt)
+            DEBIAN_FRONTEND=noninteractive apt-get update -qq >/dev/null 2>&1 || true
+            # --reinstall：二进制被人为删除但包状态仍是 installed 时，
+            # 普通 install 不会补文件（dpkg 认为已装）。
+            DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --reinstall "${missing[@]}" >/dev/null 2>&1 \
+                || DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${missing[@]}" >/dev/null 2>&1
+            ;;
+        apk) apk add --quiet --no-progress "${missing[@]}" >/dev/null 2>&1 ;;
+    esac
+
+    local still=()
+    for b in "${missing[@]}"; do
+        command -v "$b" >/dev/null 2>&1 || still+=("$b")
+    done
+    (( ${#still[@]} )) && die "依赖安装失败: ${still[*]}，请手动安装后重试"
+    info "依赖已补齐: ${missing[*]}"
+}
+
 install_deps() {
     step "安装基础依赖"
     local pkgs=(curl wget tar unzip openssl ca-certificates jq iptables iproute2)
@@ -555,6 +587,14 @@ node_new() {
             local c; c=$(ask "选择" "1")
             [[ "$c" == 2 ]] && N_MODE=ws || N_MODE=reality
             ;;
+        anytls)
+            echo ""
+            echo "  模式："
+            echo "    1) Reality       无需域名，直接监听公网端口（推荐）"
+            echo "    2) TLS 自签      自签证书，客户端需允许不安全连接"
+            local c; c=$(ask "选择" "1")
+            [[ "$c" == 2 ]] && N_MODE=tls || N_MODE=reality
+            ;;
         vmess)
             echo ""
             echo "  模式："
@@ -632,8 +672,17 @@ node_new() {
         anytls)
             N_USER="user"
             N_PASS=$(gen_password)
-            N_SNI=$(ask "SNI（自签证书 CN）" "node${N_ID}.local")
-            gen_selfsigned_cert "$N_ID" "$N_SNI"
+            if [[ "$N_MODE" == reality ]]; then
+                echo ""
+                N_DEST=$(pick_reality_sni)
+                N_SNI="$N_DEST"
+                local pair; pair=$(gen_reality_keys "$core")
+                N_PRIV="${pair%% *}"; N_PUB="${pair##* }"
+                N_SID=$(gen_hex 8)
+            else
+                N_SNI=$(ask "SNI（自签证书 CN）" "node${N_ID}.local")
+                gen_selfsigned_cert "$N_ID" "$N_SNI"
+            fi
             ;;
         wireguard)
             # 服务端与客户端各自一对 X25519 密钥；peer 里放的是「客户端公钥」
@@ -830,13 +879,26 @@ sb_node_json() {
                       certificate_path:$crt,key_path:$key}}'
         ;;
     anytls)
-        jq -cn --arg tag "$tag" --arg listen "$listen" --argjson port "$port" \
-               --arg name "$N_USER" --arg pass "$N_PASS" --arg sni "$N_SNI" \
-               --arg crt "${CERT_DIR}/${N_ID}.crt" --arg key "${CERT_DIR}/${N_ID}.key" \
-               '{type:"anytls",tag:$tag,listen:$listen,listen_port:$port,
-                 users:[{name:$name,password:$pass}],
-                 tls:{enabled:true,server_name:$sni,
-                      certificate_path:$crt,key_path:$key}}'
+        if [[ "$N_MODE" == reality ]]; then
+            jq -cn --arg tag "$tag" --arg listen "$listen" --argjson port "$port" \
+                   --arg name "$N_USER" --arg pass "$N_PASS" \
+                   --arg sni "$N_SNI" --arg dest "$N_DEST" \
+                   --arg priv "$N_PRIV" --arg sid "$N_SID" \
+                   '{type:"anytls",tag:$tag,listen:$listen,listen_port:$port,
+                     users:[{name:$name,password:$pass}],
+                     tls:{enabled:true,server_name:$sni,
+                          reality:{enabled:true,
+                                   handshake:{server:$dest,server_port:443},
+                                   private_key:$priv,short_id:[$sid]}}}'
+        else
+            jq -cn --arg tag "$tag" --arg listen "$listen" --argjson port "$port" \
+                   --arg name "$N_USER" --arg pass "$N_PASS" --arg sni "$N_SNI" \
+                   --arg crt "${CERT_DIR}/${N_ID}.crt" --arg key "${CERT_DIR}/${N_ID}.key" \
+                   '{type:"anytls",tag:$tag,listen:$listen,listen_port:$port,
+                     users:[{name:$name,password:$pass}],
+                     tls:{enabled:true,server_name:$sni,
+                          certificate_path:$crt,key_path:$key}}'
+        fi
         ;;
     *)
         return 1
@@ -1527,8 +1589,13 @@ node_link() {
             "$N_UUID" "$N_PASS" "$host" "$N_PORT" "$N_SNI" "$tagq"
         ;;
     anytls)
-        printf 'anytls://%s@%s:%s?sni=%s&insecure=1#%s' \
-            "$N_PASS" "$host" "$N_PORT" "$N_SNI" "$tagq"
+        if [[ "$N_MODE" == reality ]]; then
+            printf 'anytls://%s@%s:%s?security=reality&sni=%s&fp=chrome&pbk=%s&sid=%s#%s' \
+                "$N_PASS" "$host" "$N_PORT" "$N_SNI" "$N_PUB" "$N_SID" "$tagq"
+        else
+            printf 'anytls://%s@%s:%s?sni=%s&insecure=1#%s' \
+                "$N_PASS" "$host" "$N_PORT" "$N_SNI" "$tagq"
+        fi
         ;;
     wireguard)
         cat <<EOF
@@ -1566,7 +1633,7 @@ node_show() {
     [[ -n "$N_UUID" && "$N_PROTO" != wireguard ]] && kv "UUID" "$N_UUID"
     [[ -n "$N_PASS" ]] && kv "密码" "$N_PASS"
     [[ -n "$N_USER" && ( "$N_PROTO" == socks || "$N_PROTO" == http ) ]] && kv "用户名" "$N_USER"
-    [[ "$N_MODE" == reality ]] && { kv "公钥 pbk" "$N_PUB"; kv "Short ID" "$N_SID"; }
+    [[ "$N_MODE" == reality ]] && { kv "伪装域名" "$N_DEST"; kv "公钥 pbk" "$N_PUB"; kv "Short ID" "$N_SID"; }
 
     hr
     printf '%s  链接：%s\n' "$YELLOW" "$NC"
@@ -1999,6 +2066,7 @@ EOF
 main() {
     check_root
     detect_os
+    ensure_runtime_deps
 
     local cmd="${1:-menu}"
     case "$cmd" in
